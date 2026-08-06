@@ -568,7 +568,7 @@ INDIAN_STOCKS = {
         "ABGSHIP.NS": "ABG Shipyard Limited",
         "BEL.NS": "Bharat Electronics Limited",
         "BHARATIDIL.NS": "Bharati Defence And Infrastructure Limited",
-        "RDEL.NS": "Reliance Defence and Engineering Limited"
+        "RDEL.NS": "Reliance Defence and Engineering Limited",
         "COCHINSHIP.BO": "COCHIN SHIPYARD LTD."
     },
 
@@ -676,12 +676,18 @@ INDIAN_STOCKS = {
         "SICAL.NS": "Sical Logistics Limited",
         "SNOWMAN.NS": "Snowman Logistics Limited",
         "TCI.NS": "Transport Corporation of India Limited"
+    },
 
-    }
+    # ========================================================================
+    # >>> ADD THE REST OF YOUR CATEGORY LISTS BELOW, IN THE SAME FORMAT <<<
+    #
+    #     "Category Name": {
+    #         "TICKER.NS": "Company Name",
+    #         "TICKER2.NS": "Company Name 2"      <- last entry: no comma
+    #     },
+    # ========================================================================
 
 }
-
-(ADD THE REST OF LISTS BELOW)
 
 # ============================================================================
 # COMPREHENSIVE INDUSTRY-SPECIFIC BENCHMARKS SYSTEM
