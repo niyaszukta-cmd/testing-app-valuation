@@ -1844,12 +1844,99 @@ def evaluate_breakout(feat, direction="Bullish Breakout", rel_vol_threshold=1.5,
 
 
 # ---------------------------------------------------------------------------
+# Valuation enrichment for breakout hits (fair value + upside %)
+# ---------------------------------------------------------------------------
+def get_valuation_tag(upside):
+    """Human readable valuation status from the upside percentage"""
+    if upside is None or pd.isna(upside):
+        return "❔ No Data"
+    if upside > 25:
+        return "🚀 Deep Value"
+    if upside > 15:
+        return "✅ Undervalued"
+    if upside > 0:
+        return "📥 Fairly Valued"
+    if upside > -10:
+        return "⏸️ Slightly Rich"
+    return "⚠️ Overvalued"
+
+
+def enrich_breakout_with_valuation(rows, show_progress=True):
+    """
+    Attach fundamental fair value / upside to the breakout candidates.
+
+    Runs ONLY on the stocks that already passed the technical screen, so the
+    extra yfinance calls stay small. fetch_stock_data() is cached for 1 hour,
+    so repeat scans in the same session are instant.
+    """
+    if not rows:
+        return rows
+
+    total = len(rows)
+    progress_bar = st.progress(0) if show_progress else None
+    status_text = st.empty() if show_progress else None
+
+    for n, row in enumerate(rows):
+        ticker = row['Ticker']
+        if show_progress:
+            try:
+                progress_bar.progress(min((n + 1) / total, 1.0))
+                status_text.text(f"💰 Valuing breakout candidates... {n + 1}/{total} — {ticker}")
+            except Exception:
+                pass
+
+        fair_value = None
+        upside = None
+        pe_ratio = None
+        market_cap = None
+        cap_type = None
+
+        try:
+            fundamentals = get_stock_fundamentals(ticker)
+            if fundamentals and fundamentals.get('price'):
+                # Prefer the curated category from INDIAN_STOCKS, else yfinance industry
+                stock_info = get_stock_info(ticker)
+                industry = stock_info['category'] if stock_info else fundamentals.get('industry', 'Other')
+                cap_type = fundamentals.get('cap_type', 'Large')
+                pe_ratio = fundamentals.get('trailing_pe')
+                market_cap = fundamentals.get('market_cap')
+
+                fv = calculate_fair_value(fundamentals, industry, cap_type)
+                if fv and fv > 0:
+                    ref_price = fundamentals['price']
+                    up = ((fv - ref_price) / ref_price) * 100
+                    # Guard against garbage fundamentals producing absurd numbers
+                    if -95 <= up <= 350:
+                        fair_value = fv
+                        upside = up
+        except Exception:
+            pass
+
+        row['Fair Value'] = fair_value
+        row['Upside %'] = upside
+        row['Value Tag'] = get_valuation_tag(upside)
+        row['PE Ratio'] = pe_ratio
+        row['Market Cap'] = market_cap
+        row['Cap Type'] = cap_type
+
+    if show_progress:
+        try:
+            progress_bar.empty()
+            status_text.empty()
+        except Exception:
+            pass
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Main lower-timeframe screener
 # ---------------------------------------------------------------------------
 def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout",
                           rel_vol_threshold=1.5, min_price=10.0, min_avg_volume=25000,
                           donchian_len=20, min_score=55, required_criteria=None,
-                          max_results=50, chunk_size=25):
+                          max_results=50, chunk_size=25,
+                          include_valuation=True, min_upside=None):
     """
     Screen a universe of stocks for intraday breakouts on 15m / 1h timeframes.
     `universe` is a dict of {ticker: company_name}.
@@ -1903,6 +1990,9 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
                 'Name': universe.get(ticker, ticker),
                 'Timeframe': cfg['label'],
                 'LTP': feat['price'],
+                'Fair Value': None,      # filled by enrich_breakout_with_valuation()
+                'Upside %': None,        # filled by enrich_breakout_with_valuation()
+                'Value Tag': None,       # filled by enrich_breakout_with_valuation()
                 'Day Chg %': feat['day_change_pct'],
                 'Score': verdict['score'],
                 'Setup': ("🆕 Fresh Breakout" if verdict['fresh'] else "🔁 Continuation") if direction.startswith("Bullish")
@@ -1937,10 +2027,25 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
     except Exception:
         pass
 
+    if not results:
+        return pd.DataFrame()
+
+    # Rank technically first, trim to max_results, THEN value only the survivors
+    results = sorted(results, key=lambda r: (r['Score'], r['Rel Vol']), reverse=True)
+    results = results[:max_results]
+
+    if include_valuation:
+        results = enrich_breakout_with_valuation(results)
+
     df_out = pd.DataFrame(results)
+
+    # Optional: keep only breakouts that are ALSO undervalued
+    if include_valuation and min_upside is not None and not df_out.empty:
+        df_out = df_out[df_out['Upside %'].notna() & (df_out['Upside %'] >= min_upside)]
+
     if not df_out.empty:
         df_out = df_out.sort_values(['Score', 'Rel Vol'], ascending=[False, False])
-        df_out = df_out.head(max_results).reset_index(drop=True)
+        df_out = df_out.reset_index(drop=True)
     return df_out
 
 
@@ -2596,6 +2701,28 @@ def main():
                                                  help="Liquidity filter on the average volume per candle")
         max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="bo_max_results")
         
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**💰 Valuation Overlay**")
+        
+        include_valuation = st.sidebar.checkbox(
+            "Fetch Fair Value & Upside %",
+            value=True,
+            help="Runs the fundamental fair-value model on the stocks that pass the "
+                 "technical screen. Adds a few seconds per scan; results are cached for 1 hour."
+        )
+        
+        min_upside = None
+        if include_valuation:
+            apply_upside_filter = st.sidebar.checkbox(
+                "Only show undervalued breakouts",
+                value=False,
+                help="Keeps only setups that are breaking out AND trading below fair value"
+            )
+            if apply_upside_filter:
+                min_upside = st.sidebar.slider("Min Upside %", -20, 100, 15, 5)
+        
+        st.sidebar.markdown("---")
+        
         required_criteria = st.sidebar.multiselect(
             "🔒 Mandatory Criteria",
             options=list(BREAKOUT_CRITERIA_LABELS.keys()),
@@ -2648,7 +2775,9 @@ def main():
                         donchian_len=donchian_len,
                         min_score=min_score,
                         required_criteria=required_criteria,
-                        max_results=max_results
+                        max_results=max_results,
+                        include_valuation=include_valuation,
+                        min_upside=min_upside
                     )
                 
                 st.session_state['breakout_results'] = bo_df
@@ -2677,24 +2806,40 @@ def main():
                 ''', unsafe_allow_html=True)
                 
                 # Summary metrics
-                s1, s2, s3, s4 = st.columns(4)
+                s1, s2, s3, s4, s5 = st.columns(5)
                 s1.metric("Setups Found", len(bo_df))
                 s2.metric("Avg Score", f"{bo_df['Score'].mean():.0f}")
                 s3.metric("Avg Rel Vol", f"{bo_df['Rel Vol'].mean():.2f}x")
                 s4.metric("Fresh Breakouts", int(bo_df['Setup'].str.contains('Fresh').sum()))
                 
+                if 'Upside %' in bo_df.columns and bo_df['Upside %'].notna().any():
+                    _avg_up = bo_df['Upside %'].dropna().mean()
+                    _undervalued = int((bo_df['Upside %'].dropna() >= 15).sum())
+                    s5.metric("Avg Upside", f"{_avg_up:+.1f}%",
+                              delta=f"{_undervalued} undervalued", delta_color="off")
+                else:
+                    s5.metric("Avg Upside", "N/A")
+                
                 bo_display = bo_df.copy()
                 
-                for col in ['LTP', 'Breakout Level', 'VWAP', 'EMA20', 'EMA50',
+                for col in ['LTP', 'Fair Value', 'Breakout Level', 'VWAP', 'EMA20', 'EMA50',
                             'ORB High', 'ORB Low', 'Prev Day High', 'Prev Day Low']:
                     if col in bo_display.columns:
                         bo_display[col] = bo_display[col].apply(
                             lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
                 
-                for col in ['Day Chg %', 'VWAP Dist %']:
+                for col in ['Day Chg %', 'VWAP Dist %', 'Upside %']:
                     if col in bo_display.columns:
                         bo_display[col] = bo_display[col].apply(
                             lambda x: f"{x:+.2f}%" if pd.notna(x) else 'N/A')
+                
+                if 'PE Ratio' in bo_display.columns:
+                    bo_display['PE Ratio'] = bo_display['PE Ratio'].apply(
+                        lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
+                
+                if 'Market Cap' in bo_display.columns:
+                    bo_display['Market Cap'] = bo_display['Market Cap'].apply(
+                        lambda x: f"₹{x/10000000:,.0f}Cr" if pd.notna(x) else 'N/A')
                 
                 if 'ATR %' in bo_display.columns:
                     bo_display['ATR %'] = bo_display['ATR %'].apply(
@@ -2713,9 +2858,10 @@ def main():
                     bo_display['Rel Vol'] = bo_display['Rel Vol'].apply(
                         lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
                 
-                bo_columns = ['Ticker', 'Name', 'Timeframe', 'LTP', 'Day Chg %', 'Score', 'Setup',
-                              'Breakout Level', 'Volume', 'Rel Vol', 'Session Volume',
-                              'VWAP', 'VWAP Dist %', 'RSI', 'ATR %', 'Last Candle', 'Valuation']
+                bo_columns = ['Ticker', 'Name', 'Timeframe', 'LTP', 'Fair Value', 'Upside %',
+                              'Value Tag', 'Day Chg %', 'Score', 'Setup', 'Breakout Level',
+                              'Volume', 'Rel Vol', 'Session Volume', 'VWAP', 'VWAP Dist %',
+                              'RSI', 'ATR %', 'PE Ratio', 'Cap Type', 'Last Candle', 'Valuation']
                 bo_columns = [c for c in bo_columns if c in bo_display.columns]
                 
                 st.dataframe(
