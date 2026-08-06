@@ -569,8 +569,8 @@ INDIAN_STOCKS = {
         "ABGSHIP.NS": "ABG Shipyard Limited",
         "BEL.NS": "Bharat Electronics Limited",
         "BHARATIDIL.NS": "Bharati Defence And Infrastructure Limited",
-        "RDEL.NS": "Reliance Defence and Engineering Limited"
-        "COCHINSHIP.BO": "COCHIN SHIPYARD LTD."
+        "RDEL.NS": "Reliance Defence and Engineering Limited",
+        "COCHINSHIP.BO":"COCHIN SHIPYARD LTD."
     },
 
     "Agricultural Chemicals": {
