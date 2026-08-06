@@ -676,7 +676,6 @@ INDIAN_STOCKS = {
         "SICAL.NS": "Sical Logistics Limited",
         "SNOWMAN.NS": "Snowman Logistics Limited",
         "TCI.NS": "Transport Corporation of India Limited"
-    },
 
     }
 
