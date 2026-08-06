@@ -1,0 +1,17 @@
+# ============================================================================
+# NYZTrade Dashboard — pinned versions (reproducible deploys)
+# ----------------------------------------------------------------------------
+# These exact versions were installed and the app was booted successfully
+# against them on Python 3.12. Use this file when you want a deploy that
+# cannot drift; use requirements.txt when you want automatic minor upgrades.
+#
+# Install:  pip install -r requirements-lock.txt
+# ============================================================================
+
+streamlit==1.61.1
+yfinance==1.5.2
+curl_cffi==0.16.0
+pandas==2.3.3
+numpy==2.4.4
+plotly==6.9.0
+reportlab==4.4.10
