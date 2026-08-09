@@ -1424,55 +1424,26 @@ def search_stocks_by_name(query, max_results=50):
     return results
 
 # ============================================================================
-# LOWER TIMEFRAME BREAKOUT SCREENER ENGINE (1 HOUR / 15 MINUTE)
+# EARNINGS + VALUE SCREENER
 # ----------------------------------------------------------------------------
 # DESIGN NOTES
 #
-# The scoring model deliberately uses only FIVE factors. Earlier drafts used
-# eleven, but most of them measured the same underlying thing: an N-bar range
-# break, an opening-range break and a previous-day-high break are all "price is
-# above a recent high" and fire together, so the composite score clustered in a
-# narrow band and stopped discriminating between good and mediocre setups.
+# Exactly three criteria, and no technical/momentum model at all:
 #
-# Each factor is now GRADED (0.0 - 1.0) rather than binary. A break that clears
-# its level by 0.6 ATR on 3x volume out of a 40-bar base should not score the
-# same as one that clears by 0.02 ATR on 1.5x volume out of a 6-bar base.
+#   1. Price is near its 52-week high
+#   2. Price is below the fair value estimate
+#   3. Earnings fall inside a chosen calendar window
 #
-# Structural conditions - trend alignment, volume, liquidity - are HARD GATES
-# rather than score contributors. A breakout against the daily trend is not
-# "a slightly lower score", it is a different (and worse) trade.
+# The stages run cheapest-first. Stage 1 works from batched daily bars and
+# typically removes most of a universe for the cost of a few requests. Only
+# the survivors reach the per-ticker calls in stages 2 and 3, both of which
+# are cached (fair value 1h, earnings dates 1h).
 #
-# The screener is PURELY TECHNICAL. Fair Value and Upside are fetched for
-# display so you can see what you are buying, but no fundamental figure is
-# ever allowed to remove a valid technical setup from the results.
+# The two earnings windows are OPPOSITE trades and the UI says so. "Reported
+# in the last N days" is post-earnings drift: the event is behind you and the
+# surprise is known. "Due in the next N days" means holding through a binary
+# event, where a gap passes straight through a stop.
 # ============================================================================
-
-# Timeframe configuration
-SCREENER_TIMEFRAMES = {
-    "15 Minute": {
-        "interval": "15m",
-        "period": "30d",
-        "label": "15m",
-        "session_vwap": True,
-        "note": "Intraday. Yahoo caps 15m history at 60 days."
-    },
-    "1 Hour": {
-        "interval": "1h",
-        "period": "90d",
-        "label": "1H",
-        "session_vwap": True,
-        "note": "Intraday. Roughly 7 candles per session."
-    },
-    "1 Day": {
-        "interval": "1d",
-        "period": "2y",
-        "label": "1D",
-        "session_vwap": False,
-        "note": "Positional. VWAP becomes a rolling 20-day VWAP, since a daily "
-                "candle has no intraday session to anchor to."
-    },
-}
-
 
 def _ns(symbols):
     """Helper to append NSE suffix to a list of raw symbols"""
@@ -1523,57 +1494,6 @@ BREAKOUT_PRESET_UNIVERSES = {
 # ---------------------------------------------------------------------------
 # Indicator helpers
 # ---------------------------------------------------------------------------
-def calculate_rsi(series, period=14):
-    """Wilder's RSI"""
-    try:
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
-    except Exception:
-        return pd.Series(index=series.index, dtype=float)
-
-
-def calculate_atr_series(high, low, close, period=14):
-    """Average True Range series"""
-    try:
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.ewm(alpha=1 / period, adjust=False).mean()
-    except Exception:
-        return pd.Series(index=close.index, dtype=float)
-
-
-def calculate_session_vwap(df):
-    """Session-anchored VWAP (resets every trading day) - the true intraday VWAP"""
-    try:
-        typical = (df['High'] + df['Low'] + df['Close']) / 3.0
-        volume = df['Volume'].fillna(0)
-        session_key = pd.Series(pd.to_datetime(df.index).date, index=df.index)
-        cum_pv = (typical * volume).groupby(session_key).cumsum()
-        cum_vol = volume.groupby(session_key).cumsum()
-        vwap = cum_pv / cum_vol.replace(0, np.nan)
-        return vwap.ffill()
-    except Exception:
-        return pd.Series(index=df.index, dtype=float)
-
-
-def _pct_rank(series, value):
-    """Fraction of observations below `value` (0..1). Avoids a scipy dependency."""
-    try:
-        arr = pd.Series(series).dropna().values
-        if len(arr) < 10:
-            return 0.5
-        return float((arr < value).mean())
-    except Exception:
-        return 0.5
-
-
 def format_volume(v):
     """Format volume in Indian convention (K / L / Cr)"""
     try:
@@ -1594,12 +1514,6 @@ def format_volume(v):
 # ---------------------------------------------------------------------------
 # Batch data fetching
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_intraday_batch(tickers_tuple, interval, period):
-    """Batch download intraday OHLCV for many tickers at once. Cached 5 minutes."""
-    return _batch_download(tickers_tuple, interval, period)
-
-
 def _batch_download(tickers_tuple, interval, period):
     """Shared batch downloader returning {ticker: DataFrame}"""
     tickers = list(tickers_tuple)
@@ -1643,195 +1557,363 @@ def _batch_download(tickers_tuple, interval, period):
 
 
 # ---------------------------------------------------------------------------
-# GAMMA BLAST ENGINE
+# EARNINGS CALENDAR + VALUE + 52-WEEK HIGH ENGINE
 # ---------------------------------------------------------------------------
-# A direct port of the "Nyztrade Gamma Flow" Pine v5 indicator. Every number
-# produced here reproduces the TradingView formula exactly:
+# Three criteria only:
 #
-#     volume_ratio         = volume / SMA(volume, vol_ma_len)
-#     price_momentum       = (close - close[mom_len]) / close[mom_len] * 100
-#     volatility_expansion = ATR(14) / SMA(ATR(14), 20)
+#   1. Price is approaching its 52-week high
+#   2. Price is below fair value (undervalued)
+#   3. Earnings fall inside a chosen window - either due in the next N days,
+#      or already reported in the last N days
 #
-#     gamma_score = (volume_ratio - 1) * 25
-#                 + abs(price_momentum) * 2
-#                 + (volatility_expansion - 1) * 50
-#
-#     blast (bull) = volume_ratio > vol_mult
-#                    AND rsi > rsi_bull
-#                    AND price_momentum > sensitivity
-#                    AND volatility_expansion > 1.2
-#
-#     spike        = blast AND gamma_score > score_floor
+# No breakout structure, no momentum indicators, no timeframe scanning.
 # ---------------------------------------------------------------------------
 
-def compute_blast_features(df, cfg, rsi_len=14, vol_ma_len=20, mom_len=10,
-                           sensitivity=1.5, vol_mult=2.0, rsi_bull=70.0,
-                           rsi_bear=30.0, score_floor=50.0, bullish=True):
-    """
-    Compute every Gamma Blast input for one symbol on one timeframe.
+EARNINGS_MODES = {
+    "Reported in last N days (post-earnings drift)": "reported",
+    "Due in next N days (pre-earnings run-up)": "upcoming",
+    "Either side of earnings": "either",
+    "No earnings filter": "off",
+}
 
-    Returns None when there is not enough history to form the 20-bar ATR
-    average that volatility_expansion depends on.
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_daily_history_batch(tickers_tuple, period="1y"):
+    """Daily OHLCV for the 52-week high calculation. Cached 15 minutes."""
+    return _batch_download(tickers_tuple, "1d", period)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_earnings_calendar(ticker):
     """
+    Next and most recent earnings dates for one symbol.
+
+    Returns a dict with days_to_next, days_since_last and the last surprise
+    percentage. Cached for an hour because earnings dates barely move, and
+    this is a per-ticker call - the expensive kind.
+    """
+    out = {'next_date': None, 'days_to_next': None,
+           'last_date': None, 'days_since_last': None, 'surprise_pct': None}
     try:
-        if df is None or len(df) < 45:
-            return None
-
-        d = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        d = d.dropna(subset=['Close', 'High', 'Low'])
-        if len(d) < 45:
-            return None
-
-        close, high, low = d['Close'], d['High'], d['Low']
-        volume = d['Volume'].fillna(0)
-
-        # ---- Pine inputs ----
-        rsi = calculate_rsi(close, rsi_len)
-        vol_ma = volume.rolling(vol_ma_len).mean()
-        vol_ratio_s = volume / vol_ma.replace(0, np.nan)
-        mom_s = (close - close.shift(mom_len)) / close.shift(mom_len).replace(0, np.nan) * 100
-
-        atr = calculate_atr_series(high, low, close, 14)
-        atr_ma = atr.rolling(20).mean()
-        vol_exp_s = atr / atr_ma.replace(0, np.nan)
-
-        gamma_s = ((vol_ratio_s - 1) * 25
-                   + mom_s.abs() * 2
-                   + (vol_exp_s - 1) * 50)
-
-        # ---- Blast condition, evaluated across the whole series ----
-        if bullish:
-            cond_s = ((vol_ratio_s > vol_mult) & (rsi > rsi_bull)
-                      & (mom_s > sensitivity) & (vol_exp_s > 1.2))
-        else:
-            cond_s = ((vol_ratio_s > vol_mult) & (rsi < rsi_bear)
-                      & (mom_s < -sensitivity) & (vol_exp_s > 1.2))
-        cond_s = cond_s.fillna(False)
-        spike_s = cond_s & (gamma_s > score_floor)
-
-        # ---- VWAP: session-anchored intraday, rolling on the daily chart ----
-        if cfg.get('session_vwap', True):
-            vwap_s = calculate_session_vwap(d)
-        else:
-            typical = (high + low + close) / 3.0
-            pv = (typical * volume).rolling(20).sum()
-            vv = volume.rolling(20).sum().replace(0, np.nan)
-            vwap_s = pv / vv
-
-        i = -1
-        last_close = float(close.iloc[i])
-        last_vol = float(volume.iloc[i]) if not pd.isna(volume.iloc[i]) else 0.0
-        avg_vol = float(vol_ma.iloc[i]) if not pd.isna(vol_ma.iloc[i]) else 0.0
-        last_atr = float(atr.iloc[i]) if not pd.isna(atr.iloc[i]) else 0.0
-        last_vwap = float(vwap_s.iloc[i]) if not pd.isna(vwap_s.iloc[i]) else None
-
-        vol_ratio = float(vol_ratio_s.iloc[i]) if not pd.isna(vol_ratio_s.iloc[i]) else 0.0
-        momentum = float(mom_s.iloc[i]) if not pd.isna(mom_s.iloc[i]) else 0.0
-        vol_expansion = float(vol_exp_s.iloc[i]) if not pd.isna(vol_exp_s.iloc[i]) else 1.0
-        gamma_score = float(gamma_s.iloc[i]) if not pd.isna(gamma_s.iloc[i]) else 0.0
-
-        blast_now = bool(cond_s.iloc[i])
-        blast_prev = bool(cond_s.iloc[i - 1]) if len(cond_s) > 1 else False
-        spike_now = bool(spike_s.iloc[i])
-
-        # How many consecutive bars has the blast been firing?
-        streak = 0
-        for k in range(1, min(len(cond_s), 40) + 1):
-            if bool(cond_s.iloc[-k]):
-                streak += 1
-            else:
-                break
-
-        # How often does this stock blast? A name that fires constantly is
-        # noisy, not exceptional — this is the context the raw score lacks.
-        blast_freq = int(cond_s.iloc[-100:].sum()) if len(cond_s) >= 100 else int(cond_s.sum())
-
-        # Percentile of the current score against this stock's own history
-        gamma_rank = 0.5
+        tk = yf.Ticker(ticker)
+        df = None
         try:
-            g_hist = gamma_s.dropna().iloc[-150:]
-            if len(g_hist) >= 30:
-                gamma_rank = _pct_rank(g_hist, gamma_score)
+            df = tk.get_earnings_dates(limit=16)
         except Exception:
-            pass
+            df = None
 
-        # ---- Session / prior-bar context ----
-        if cfg.get('session_vwap', True):
-            session_key = pd.Series(pd.to_datetime(d.index).date, index=d.index)
-            sessions = list(dict.fromkeys(session_key.tolist()))
-            cur = d[session_key == sessions[-1]]
-            session_volume = float(cur['Volume'].fillna(0).sum()) if not cur.empty else last_vol
-            ref_close = None
-            if len(sessions) >= 2:
-                prev = d[session_key == sessions[-2]]
-                if not prev.empty:
-                    ref_close = float(prev['Close'].iloc[-1])
-        else:
-            session_volume = last_vol
-            ref_close = float(close.iloc[i - 1])
+        if df is not None and not df.empty:
+            idx = pd.to_datetime(df.index)
+            tz = getattr(idx, 'tz', None)
+            now = pd.Timestamp.now(tz=tz) if tz is not None else pd.Timestamp.now()
+
+            # Yahoo labels the surprise column inconsistently across versions
+            surprise_col = next((c for c in df.columns if 'surprise' in str(c).lower()), None)
+            reported_col = next((c for c in df.columns if 'reported' in str(c).lower()), None)
+
+            future = [d for d in idx if d > now]
+            past = [d for d in idx if d <= now]
+
+            if future:
+                nxt = min(future)
+                out['next_date'] = nxt
+                out['days_to_next'] = int((nxt - now).days)
+
+            if past:
+                last = max(past)
+                # Prefer the most recent date that actually has a reported figure
+                if reported_col is not None:
+                    reported = [d for d in past if pd.notna(df.loc[d, reported_col])] \
+                               if reported_col in df.columns else []
+                    if reported:
+                        last = max(reported)
+                out['last_date'] = last
+                out['days_since_last'] = int((now - last).days)
+                if surprise_col is not None and surprise_col in df.columns:
+                    val = df.loc[last, surprise_col]
+                    if pd.notna(val):
+                        out['surprise_pct'] = float(val)
+
+        # Fallback for the next date only
+        if out['next_date'] is None:
+            try:
+                cal = tk.calendar
+                dates = None
+                if isinstance(cal, dict):
+                    dates = cal.get('Earnings Date')
+                elif cal is not None and hasattr(cal, 'loc'):
+                    dates = cal.loc['Earnings Date'].tolist() if 'Earnings Date' in cal.index else None
+                if dates:
+                    if not isinstance(dates, (list, tuple)):
+                        dates = [dates]
+                    nxt = pd.Timestamp(min(dates))
+                    now = pd.Timestamp.now()
+                    if nxt > now:
+                        out['next_date'] = nxt
+                        out['days_to_next'] = int((nxt - now).days)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def compute_52w_features(df):
+    """Price position against the 52-week high, plus volume context."""
+    try:
+        if df is None or len(df) < 60:
+            return None
+        d = df[['High', 'Low', 'Close', 'Volume']].dropna(subset=['Close'])
+        if len(d) < 60:
+            return None
+
+        window = d.iloc[-252:] if len(d) >= 252 else d
+        high_52w = float(window['High'].max())
+        low_52w = float(window['Low'].min())
+        price = float(d['Close'].iloc[-1])
+        if high_52w <= 0 or price <= 0:
+            return None
+
+        volume = d['Volume'].fillna(0)
+        last_vol = float(volume.iloc[-1])
+        avg_vol = float(volume.rolling(20).mean().iloc[-1]) if len(volume) >= 20 else last_vol
+        prev_close = float(d['Close'].iloc[-2]) if len(d) > 1 else price
+
+        # Negative = below the high. -2.0 means 2% under the 52-week high.
+        pct_from_high = (price - high_52w) / high_52w * 100
 
         return {
-            'price': last_close,
+            'price': price,
+            'high_52w': high_52w,
+            'low_52w': low_52w,
+            'pct_from_high': pct_from_high,
+            'pct_from_low': (price - low_52w) / low_52w * 100 if low_52w > 0 else None,
             'last_volume': last_vol,
             'avg_volume': avg_vol,
-            'session_volume': session_volume,
-            'vol_ratio': vol_ratio,
-            'rsi': float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else 50.0,
-            'momentum': momentum,
-            'vol_expansion': vol_expansion,
-            'gamma_score': gamma_score,
-            'gamma_rank': gamma_rank,
-            'blast': blast_now,
-            'blast_prev': blast_prev,
-            'spike': spike_now,
-            'streak': streak,
-            'blast_freq': blast_freq,
-            'atr': last_atr,
-            'atr_pct': (last_atr / last_close * 100) if last_close else 0.0,
-            'vwap': last_vwap,
-            'day_change_pct': ((last_close - ref_close) / ref_close * 100) if ref_close else 0.0,
-            'last_bar_time': d.index[i],
+            'rel_volume': (last_vol / avg_vol) if avg_vol > 0 else 0.0,
+            'chg_pct': (price - prev_close) / prev_close * 100 if prev_close else 0.0,
+            'last_bar': d.index[-1],
         }
     except Exception:
         return None
 
 
-def evaluate_blast(feat, spike_only=False, min_score=50.0):
+def earnings_window_passes(cal, mode, upcoming_days, reported_days):
+    """Apply the chosen earnings-window rule. Returns (passes, status_label)."""
+    d_next = cal.get('days_to_next')
+    d_last = cal.get('days_since_last')
+
+    upcoming = d_next is not None and 0 <= d_next <= upcoming_days
+    reported = d_last is not None and 0 <= d_last <= reported_days
+
+    if mode == "off":
+        # No window applies here, so report the real dates rather than
+        # pretending a stock 45 days from earnings has no date at all.
+        if d_next is not None and d_last is not None:
+            return True, (f"🔜 In {d_next}d" if d_next <= d_last else f"✅ {d_last}d ago")
+        if d_next is not None:
+            return True, f"🔜 In {d_next}d"
+        if d_last is not None:
+            return True, f"✅ {d_last}d ago"
+        return True, "— No date"
+
+    if mode == "upcoming":
+        return upcoming, (f"🔜 In {d_next}d" if upcoming else "")
+
+    if mode == "reported":
+        return reported, (f"✅ {d_last}d ago" if reported else "")
+
+    # either
+    if upcoming and reported:
+        return True, f"🔁 {d_last}d ago → {d_next}d"
+    if upcoming:
+        return True, f"🔜 In {d_next}d"
+    if reported:
+        return True, f"✅ {d_last}d ago"
+    return False, ""
+
+
+def run_earnings_value_screener(universe, near_high_pct=5.0, min_upside=15.0,
+                                earnings_mode="reported", upcoming_days=30,
+                                reported_days=30, min_price=20.0,
+                                min_avg_volume=50000, max_results=40,
+                                max_valuation_calls=150, chunk_size=25,
+                                final_rank="Upside %"):
     """
-    Accept or reject a candidate on the blast condition alone.
+    Three-stage funnel, ordered cheapest first.
 
-    Returns None when the blast is not firing, so nothing reaches the results
-    table unless the full Pine condition is satisfied.
+      1. Daily bars, batched  - 52-week high proximity, price, liquidity
+      2. Fair value           - per ticker, cached, only on stage-1 survivors
+      3. Earnings calendar    - per ticker, cached, only on stage-2 survivors
+
+    Stages 2 and 3 are per-ticker calls, so the ordering matters: stage 1
+    typically removes 90% of a universe for the cost of a handful of requests.
     """
-    if not feat or not feat.get('blast'):
-        return None
-    if spike_only and not feat.get('spike'):
-        return None
-    if feat.get('gamma_score', 0.0) < min_score:
-        return None
+    tickers = list(universe.keys())
+    total = len(tickers)
+    funnel = {'scanned': 0, 'with_data': 0, 'near_high': 0,
+              'undervalued': 0, 'earnings_ok': 0, 'final': 0}
 
-    # The three additive terms of the Pine score, exposed so you can see which
-    # one is carrying the signal. Volume-only blasts behave differently from
-    # volatility-expansion blasts.
-    vol_component = (feat['vol_ratio'] - 1) * 25
-    mom_component = abs(feat['momentum']) * 2
-    exp_component = (feat['vol_expansion'] - 1) * 50
+    if total == 0:
+        return pd.DataFrame(), funnel
 
-    if feat['spike']:
-        signal = "💥 Spike"
+    # ---------------- STAGE 1: 52-week high proximity ----------------
+    stage1 = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    processed = 0
+
+    for start in range(0, total, chunk_size):
+        chunk = tickers[start:start + chunk_size]
+        status_text.text(f"📈 Stage 1/3 — 52-week high scan... "
+                         f"{processed}/{total} | near high: {len(stage1)}")
+        data_map = fetch_daily_history_batch(tuple(chunk), "1y")
+
+        for ticker in chunk:
+            processed += 1
+            funnel['scanned'] += 1
+            try:
+                progress_bar.progress(min(processed / total * 0.5, 0.5))
+            except Exception:
+                pass
+
+            df = data_map.get(ticker)
+            if df is None or df.empty:
+                continue
+            funnel['with_data'] += 1
+
+            feat = compute_52w_features(df)
+            if not feat:
+                continue
+            if feat['price'] < min_price or feat['avg_volume'] < min_avg_volume:
+                continue
+            # pct_from_high is negative below the high; -near_high_pct is the floor
+            if feat['pct_from_high'] < -abs(near_high_pct):
+                continue
+
+            funnel['near_high'] += 1
+            stage1.append({'ticker': ticker, 'feat': feat})
+
+    # Closest to the high first, then cap the per-ticker work that follows
+    stage1.sort(key=lambda c: c['feat']['pct_from_high'], reverse=True)
+    stage1 = stage1[:max_valuation_calls]
+
+    # ---------------- STAGE 2: valuation ----------------
+    rows = []
+    for n, c in enumerate(stage1):
+        ticker, feat = c['ticker'], c['feat']
+        try:
+            progress_bar.progress(min(0.5 + (n + 1) / max(len(stage1), 1) * 0.3, 0.8))
+            status_text.text(f"💰 Stage 2/3 — valuing... {n + 1}/{len(stage1)} — {ticker}")
+        except Exception:
+            pass
+
+        fair_value = upside = pe_ratio = cap_type = market_cap = None
+        try:
+            fundamentals = get_stock_fundamentals(ticker)
+            if fundamentals and fundamentals.get('price'):
+                stock_info = get_stock_info(ticker)
+                industry = stock_info['category'] if stock_info else fundamentals.get('industry', 'Other')
+                cap_type = fundamentals.get('cap_type', 'Large')
+                pe_ratio = fundamentals.get('trailing_pe')
+                market_cap = fundamentals.get('market_cap')
+                fv = calculate_fair_value(fundamentals, industry, cap_type)
+                if fv and fv > 0:
+                    ref = fundamentals['price']
+                    up = ((fv - ref) / ref) * 100
+                    if -95 <= up <= 350:
+                        fair_value, upside = fv, up
+        except Exception:
+            pass
+
+        if upside is None or upside < min_upside:
+            continue
+        funnel['undervalued'] += 1
+
+        rows.append({
+            'ticker': ticker, 'feat': feat, 'fair_value': fair_value,
+            'upside': upside, 'pe_ratio': pe_ratio, 'cap_type': cap_type,
+            'market_cap': market_cap
+        })
+
+    # ---------------- STAGE 3: earnings calendar ----------------
+    final_rows = []
+    for n, r in enumerate(rows):
+        ticker, feat = r['ticker'], r['feat']
+        try:
+            progress_bar.progress(min(0.8 + (n + 1) / max(len(rows), 1) * 0.2, 1.0))
+            status_text.text(f"📅 Stage 3/3 — earnings dates... {n + 1}/{len(rows)} — {ticker}")
+        except Exception:
+            pass
+
+        cal = fetch_earnings_calendar(ticker)
+        passes, status = earnings_window_passes(cal, earnings_mode,
+                                                upcoming_days, reported_days)
+        if not passes:
+            continue
+        funnel['earnings_ok'] += 1
+
+        surprise = cal.get('surprise_pct')
+        if surprise is None:
+            surprise_tag = "—"
+        elif surprise > 0:
+            surprise_tag = f"🟢 Beat {surprise:+.1f}%"
+        elif surprise < 0:
+            surprise_tag = f"🔴 Miss {surprise:+.1f}%"
+        else:
+            surprise_tag = "⚪ In line"
+
+        final_rows.append({
+            'Ticker': ticker,
+            'Name': universe.get(ticker, ticker),
+            'LTP': feat['price'],
+            'Chg %': feat['chg_pct'],
+            '52W High': feat['high_52w'],
+            'From High %': feat['pct_from_high'],
+            'Fair Value': r['fair_value'],
+            'Upside %': r['upside'],
+            'Value Tag': get_valuation_tag(r['upside']),
+            'Earnings': status,
+            'Next Earnings': cal['next_date'].strftime('%d-%b-%Y') if cal.get('next_date') is not None else 'N/A',
+            'Days To': cal.get('days_to_next'),
+            'Last Earnings': cal['last_date'].strftime('%d-%b-%Y') if cal.get('last_date') is not None else 'N/A',
+            'Days Since': cal.get('days_since_last'),
+            'Last Surprise': surprise_tag,
+            'Surprise %': surprise,
+            'Volume': feat['last_volume'],
+            'Avg Volume': feat['avg_volume'],
+            'Rel Vol': feat['rel_volume'],
+            'From Low %': feat['pct_from_low'],
+            'PE Ratio': r['pe_ratio'],
+            'Cap Type': r['cap_type'],
+            'Market Cap': r['market_cap'],
+            'As Of': feat['last_bar'].strftime('%d-%b-%Y') if hasattr(feat['last_bar'], 'strftime') else str(feat['last_bar']),
+            'Valuation': build_valuation_link(ticker),
+        })
+
+    try:
+        progress_bar.empty()
+        status_text.empty()
+    except Exception:
+        pass
+
+    if not final_rows:
+        return pd.DataFrame(), funnel
+
+    df_out = pd.DataFrame(final_rows)
+
+    if final_rank == "Closest to 52W High":
+        df_out = df_out.sort_values('From High %', ascending=False)
+    elif final_rank == "Earnings Soonest":
+        df_out = df_out.sort_values('Days To', ascending=True, na_position='last')
+    elif final_rank == "Best Surprise":
+        df_out = df_out.sort_values('Surprise %', ascending=False, na_position='last')
     else:
-        signal = "⚡ Blast"
+        df_out = df_out.sort_values('Upside %', ascending=False)
 
-    stage = "🆕 New" if not feat.get('blast_prev') else f"🔁 Bar {feat['streak']}"
-
-    return {
-        'score': round(feat['gamma_score'], 1),
-        'signal': signal,
-        'stage': stage,
-        'vol_component': vol_component,
-        'mom_component': mom_component,
-        'exp_component': exp_component,
-    }
+    df_out = df_out.head(max_results).reset_index(drop=True)
+    funnel['final'] = len(df_out)
+    return df_out, funnel
 
 
 # ---------------------------------------------------------------------------
@@ -1918,138 +2000,6 @@ def enrich_with_valuation(rows, show_progress=True):
 # ---------------------------------------------------------------------------
 # MAIN SCREENER PIPELINE
 # ---------------------------------------------------------------------------
-def run_blast_screener(universe, timeframe_label, direction="Bullish Blast",
-                       rsi_len=14, vol_ma_len=20, mom_len=10, sensitivity=1.5,
-                       vol_mult=2.0, rsi_bull=70.0, rsi_bear=30.0,
-                       score_floor=50.0, min_score=50.0, spike_only=False,
-                       min_price=10.0, min_avg_volume=25000, max_results=40,
-                       chunk_size=25, final_rank="Gamma Score",
-                       include_valuation=True):
-    """
-    Single-criterion screener: the Gamma Blast condition, nothing else.
-
-    There is no breakout-structure model, no multi-timeframe trend gate and no
-    exhaustion veto. A stock appears if and only if the Pine blast condition is
-    firing on the selected timeframe. Fair value and upside are attached
-    afterwards for context and never remove a row.
-    """
-    cfg = SCREENER_TIMEFRAMES.get(timeframe_label, SCREENER_TIMEFRAMES["15 Minute"])
-    bullish = direction.startswith("Bullish")
-    tickers = list(universe.keys())
-    total = len(tickers)
-    funnel = {'scanned': 0, 'with_data': 0, 'blast': 0, 'spike': 0, 'final': 0}
-
-    if total == 0:
-        return pd.DataFrame(), funnel
-
-    rows = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    processed = 0
-
-    for start in range(0, total, chunk_size):
-        chunk = tickers[start:start + chunk_size]
-        status_text.text(f"⚡ Scanning {cfg['label']} candles... "
-                         f"{processed}/{total} | blasts: {len(rows)}")
-        data_map = fetch_intraday_batch(tuple(chunk), cfg['interval'], cfg['period'])
-
-        for ticker in chunk:
-            processed += 1
-            funnel['scanned'] += 1
-            try:
-                progress_bar.progress(min(processed / total, 1.0))
-            except Exception:
-                pass
-
-            df = data_map.get(ticker)
-            if df is None or df.empty:
-                continue
-            funnel['with_data'] += 1
-
-            feat = compute_blast_features(
-                df, cfg, rsi_len=rsi_len, vol_ma_len=vol_ma_len, mom_len=mom_len,
-                sensitivity=sensitivity, vol_mult=vol_mult, rsi_bull=rsi_bull,
-                rsi_bear=rsi_bear, score_floor=score_floor, bullish=bullish
-            )
-            if not feat:
-                continue
-            if feat['price'] < min_price or (feat['avg_volume'] or 0) < min_avg_volume:
-                continue
-
-            if feat.get('blast'):
-                funnel['blast'] += 1
-            if feat.get('spike'):
-                funnel['spike'] += 1
-
-            verdict = evaluate_blast(feat, spike_only=spike_only, min_score=min_score)
-            if not verdict:
-                continue
-
-            vwap_dist = ((feat['price'] - feat['vwap']) / feat['vwap'] * 100) if feat.get('vwap') else None
-
-            rows.append({
-                'Ticker': ticker,
-                'Name': universe.get(ticker, ticker),
-                'Timeframe': cfg['label'],
-                'LTP': feat['price'],
-                'Fair Value': None,
-                'Upside %': None,
-                'Value Tag': None,
-                'Chg %': feat['day_change_pct'],
-                'Signal': verdict['signal'],
-                'Stage': verdict['stage'],
-                'Gamma Score': verdict['score'],
-                'Blast Rank': feat['gamma_rank'] * 100,
-                'Vol Ratio': feat['vol_ratio'],
-                'Momentum %': feat['momentum'],
-                'Vol Expansion': feat['vol_expansion'],
-                'RSI': feat['rsi'],
-                'Volume': feat['last_volume'],
-                'Avg Volume': feat['avg_volume'],
-                'Session Volume': feat['session_volume'],
-                'VWAP': feat['vwap'],
-                'VWAP Dist %': vwap_dist,
-                'ATR %': feat['atr_pct'],
-                'Streak': feat['streak'],
-                'Blasts/100': feat['blast_freq'],
-                'Vol Term': verdict['vol_component'],
-                'Mom Term': verdict['mom_component'],
-                'Exp Term': verdict['exp_component'],
-                'Last Candle': feat['last_bar_time'].strftime('%d-%b %H:%M')
-                               if hasattr(feat['last_bar_time'], 'strftime') else str(feat['last_bar_time']),
-                'Valuation': build_valuation_link(ticker),
-            })
-
-    try:
-        progress_bar.empty()
-        status_text.empty()
-    except Exception:
-        pass
-
-    if not rows:
-        return pd.DataFrame(), funnel
-
-    # Rank first, then value only the survivors
-    rows.sort(key=lambda r: r['Gamma Score'], reverse=True)
-    rows = rows[:max_results]
-
-    if include_valuation:
-        rows = enrich_with_valuation(rows)
-
-    df_out = pd.DataFrame(rows)
-
-    if final_rank == "Upside %" and 'Upside %' in df_out.columns:
-        df_out = df_out.sort_values('Upside %', ascending=False, na_position='last')
-    elif final_rank == "Blast Rank" and 'Blast Rank' in df_out.columns:
-        df_out = df_out.sort_values('Blast Rank', ascending=False, na_position='last')
-    else:
-        df_out = df_out.sort_values('Gamma Score', ascending=False)
-
-    df_out = df_out.reset_index(drop=True)
-    funnel['final'] = len(df_out)
-    return df_out, funnel
-
-
 # ---------------------------------------------------------------------------
 # Deep-link helpers: jump from screener result row -> valuation screen
 # ---------------------------------------------------------------------------
@@ -2399,7 +2349,7 @@ def main():
     # ------------------------------------------------------------------
     MODE_OPTIONS = [
         "🎯 Industry Screener",
-        "⚡ Gamma Blast Screener",
+        "📅 Earnings + Value Screener",
         "📈 Individual Analysis",
         "📊 Industry Explorer"
     ]
@@ -2631,25 +2581,13 @@ def main():
                     use_container_width=True
                 )
     
-    elif mode == "⚡ Gamma Blast Screener":
+    elif mode == "📅 Earnings + Value Screener":
         
-        st.markdown("### ⚡ Gamma Blast Screener")
-        st.caption("A direct port of the Nyztrade Gamma Flow indicator. One criterion only: "
-                   "the blast condition. No breakout structure model, no trend confirmation.")
+        st.markdown("### 📅 Earnings + Value Screener")
+        st.caption("Undervalued stocks trading near their 52-week high, filtered by where "
+                   "they sit in the earnings calendar. No breakout or momentum criteria.")
         
-        # ---------------- Sidebar controls ----------------
-        st.sidebar.markdown("### ⏱️ Timeframe & Direction")
-        
-        timeframe_label = st.sidebar.selectbox(
-            "Timeframe",
-            list(SCREENER_TIMEFRAMES.keys()),
-            index=0
-        )
-        _cfg = SCREENER_TIMEFRAMES[timeframe_label]
-        st.sidebar.caption(_cfg['note'])
-        
-        direction = st.sidebar.radio("Direction", ["Bullish Blast", "Bearish Blast"])
-        
+        # ---------------- Universe ----------------
         st.sidebar.markdown("### 🌐 Universe")
         universe_mode = st.sidebar.selectbox(
             "Source", ["Preset Watchlist", "By Industry", "Custom Tickers"]
@@ -2664,13 +2602,13 @@ def main():
             universe_label = preset
         
         elif universe_mode == "By Industry":
-            bo_industries = sorted(get_all_categories())
-            bo_options = [f"{ind} ({len(get_stocks_by_category(ind))} stocks)" for ind in bo_industries]
-            bo_selected = st.sidebar.selectbox("Industry", bo_options)
-            bo_industry = bo_selected.split(" (")[0]
-            universe = dict(get_stocks_by_category(bo_industry))
-            universe_label = bo_industry
-            scan_cap = st.sidebar.slider("Max stocks to scan", 20, 400, 120, step=20)
+            ev_industries = sorted(get_all_categories())
+            ev_options = [f"{ind} ({len(get_stocks_by_category(ind))} stocks)" for ind in ev_industries]
+            ev_selected = st.sidebar.selectbox("Industry", ev_options)
+            ev_industry = ev_selected.split(" (")[0]
+            universe = dict(get_stocks_by_category(ev_industry))
+            universe_label = ev_industry
+            scan_cap = st.sidebar.slider("Max stocks to scan", 20, 600, 200, step=20)
             if len(universe) > scan_cap:
                 universe = dict(list(universe.items())[:scan_cap])
         
@@ -2685,240 +2623,220 @@ def main():
             universe = {t: t.replace('.NS', '').replace('.BO', '') for t in raw}
             universe_label = "Custom List"
         
-        # ---------------- Pine indicator inputs ----------------
-        st.sidebar.markdown("### 💥 Blast Parameters")
-        st.sidebar.caption("These map 1:1 to the inputs in your Pine indicator.")
-        
-        vol_mult = st.sidebar.slider(
-            "Volume Threshold Multiplier", 1.0, 5.0, 2.0, 0.1,
-            help="volume_threshold — volume must exceed this multiple of its moving average."
-        )
-        sensitivity = st.sidebar.slider(
-            "Gamma Blast Sensitivity", 0.5, 3.0, 1.5, 0.1,
-            help="sensitivity — minimum rate of change, in percent, in the trade direction."
-        )
-        mom_len = st.sidebar.slider(
-            "Momentum Length", 2, 50, 10,
-            help="momentum_length — lookback for the rate of change calculation."
-        )
-        vol_ma_len = st.sidebar.slider(
-            "Volume MA Length", 5, 60, 20,
-            help="volume_ma_length — baseline for the volume ratio."
-        )
-        rsi_len = st.sidebar.slider(
-            "RSI Length", 2, 50, 14,
-            help="length — RSI period."
+        # ---------------- The three criteria ----------------
+        st.sidebar.markdown("### 📈 52-Week High Proximity")
+        near_high_pct = st.sidebar.slider(
+            "Within % of 52W high", 0.5, 25.0, 5.0, 0.5,
+            help="How close to the 52-week high the stock must be trading. "
+                 "5% means the price is no more than 5% below its 52-week high."
         )
         
-        with st.sidebar.expander("RSI thresholds"):
-            rsi_bull = st.slider("Bullish RSI above", 50.0, 90.0, 70.0, 1.0)
-            rsi_bear = st.slider("Bearish RSI below", 10.0, 50.0, 30.0, 1.0)
-        
-        st.sidebar.markdown("### 🎚️ Result Filters")
-        spike_only = st.sidebar.checkbox(
-            "Spikes only (gamma > floor)", value=False,
-            help="The Pine 'spike' marker: a blast that also clears the score floor. "
-                 "Fewer, stronger signals."
+        st.sidebar.markdown("### 💰 Valuation")
+        min_upside = st.sidebar.slider(
+            "Min Upside % vs Fair Value", 0, 100, 15, 5,
+            help="Fair value uses the same model as the Industry Screener, so the "
+                 "numbers reconcile between the two screens."
         )
-        score_floor = st.sidebar.slider("Spike Score Floor", 0, 200, 50, 5)
-        min_score = st.sidebar.slider("Min Gamma Score", 0, 200, 0, 5,
-                                      help="Applies to every result, not just spikes.")
+        
+        st.sidebar.markdown("### 📅 Earnings Window")
+        earnings_choice = st.sidebar.selectbox(
+            "Earnings filter", list(EARNINGS_MODES.keys()), index=0
+        )
+        earnings_mode = EARNINGS_MODES[earnings_choice]
+        
+        reported_days = 30
+        upcoming_days = 30
+        if earnings_mode in ("reported", "either"):
+            reported_days = st.sidebar.slider("Reported within last N days", 1, 90, 30, 1)
+        if earnings_mode in ("upcoming", "either"):
+            upcoming_days = st.sidebar.slider("Due within next N days", 1, 90, 30, 1)
+        
+        if earnings_mode == "upcoming":
+            st.sidebar.warning(
+                "⚠️ Holding into an earnings date means holding gap risk. A gap "
+                "through your stop is an uncontrolled loss, not a controlled one."
+            )
+        
+        st.sidebar.markdown("### 🎚️ Basic Filters")
         min_price = st.sidebar.number_input("Min Price (₹)", min_value=1.0, value=20.0, step=5.0)
-        min_avg_volume = st.sidebar.number_input("Min Avg Bar Volume", min_value=0,
-                                                 value=25000, step=5000)
-        max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="bo_max_results")
-        
-        st.sidebar.markdown("### 💰 Valuation (display only)")
-        include_valuation = st.sidebar.checkbox(
-            "Show Fair Value & Upside %", value=True,
-            help="Informational columns only — they never filter a stock out."
+        min_avg_volume = st.sidebar.number_input("Min Avg Daily Volume", min_value=0,
+                                                 value=50000, step=10000)
+        max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="ev_max_results")
+        max_valuation_calls = st.sidebar.slider(
+            "Max stocks to value", 25, 300, 150, 25,
+            help="Caps the per-ticker work after the 52-week high filter. Lower is faster."
         )
-        
         final_rank = st.sidebar.selectbox(
-            "Rank results by", ["Gamma Score", "Blast Rank", "Upside %"]
+            "Rank results by",
+            ["Upside %", "Closest to 52W High", "Earnings Soonest", "Best Surprise"]
         )
         
-        with st.expander("📐 What the Gamma Score measures"):
+        with st.expander("📐 How this screen works, and what the two earnings windows mean"):
             st.markdown("""
-The score is the sum of three terms, exactly as in the Pine indicator:
+Three filters, applied in this order so the expensive calls only touch survivors:
 
-| Term | Formula | Reads as |
-|---|---|---|
-| **Volume** | `(volume_ratio − 1) × 25` | How far above its own average the volume is |
-| **Momentum** | `abs(price_momentum) × 2` | Rate of change over the momentum lookback |
-| **Expansion** | `(volatility_expansion − 1) × 50` | ATR against its own 20-bar average |
+1. **Near the 52-week high** — from daily bars, batched. Breakouts into blue sky
+   have better follow-through than breakouts in the middle of a range.
+2. **Undervalued** — price below the fair value estimate, same model the Industry
+   Screener uses.
+3. **Earnings window** — where the stock sits in its reporting cycle.
 
-A stock reaches this table only when **all four** blast conditions hold at once:
-volume above the multiplier, RSI beyond its threshold, rate of change beyond
-sensitivity in the trade direction, and ATR expansion above 1.2.
+**These two earnings windows are opposite trades, and it matters which you pick.**
 
-Two caveats worth holding onto. The momentum term uses an absolute value, so the
-score itself is direction-blind — direction comes from the condition, not the
-number. And **Blast Rank** matters more than the raw score: a reading of 70 is
-routine on a habitually volatile counter and extraordinary on a quiet one. The
-**Blasts/100** column tells you how often the name fires at all; a stock showing
-30 blasts per 100 bars is not signalling anything.
+*Reported in the last N days* is **post-earnings announcement drift** — a documented
+tendency for price to keep moving in the direction of an earnings surprise for weeks
+afterwards. The event risk is behind you and the surprise is known, which is why the
+**Last Surprise** column matters most in this mode: drift follows the beats.
+
+*Due in the next N days* is the **run-up** trade, and it carries the risk I would
+normally tell you to screen out. You are holding through a binary event. A gap
+against you passes straight through a stop. If you run this mode, size for the gap
+rather than for the stop.
+
+Combining "undervalued" with "near 52-week high" is deliberately contrarian — most
+stocks near highs are not cheap. Expect few results, and treat a large `Upside %`
+on a stock at its high with suspicion: check whether the fair value is being driven
+by a single depressed input like a trailing EPS that has since recovered.
             """)
         
-        if st.sidebar.button("⚡ Run Blast Scan", type="primary"):
+        if st.sidebar.button("🔍 Run Screen", type="primary"):
             if not universe:
                 st.warning("❌ No tickers in the selected universe.")
             else:
                 st.markdown(f'''
                 <div class="highlight-box">
-                    <h3>⚡ {direction} — {timeframe_label}</h3>
+                    <h3>📅 {earnings_choice}</h3>
                     <p><strong>Universe:</strong> {universe_label} ({len(universe):,} stocks)</p>
-                    <p><strong>Volume ×:</strong> {vol_mult:.1f} &nbsp;•&nbsp;
-                       <strong>Sensitivity:</strong> {sensitivity:.1f}% &nbsp;•&nbsp;
-                       <strong>Momentum:</strong> {mom_len} bars</p>
+                    <p><strong>Within:</strong> {near_high_pct:.1f}% of 52W high &nbsp;•&nbsp;
+                       <strong>Min Upside:</strong> {min_upside}%</p>
                 </div>
                 ''', unsafe_allow_html=True)
                 
-                with st.spinner(f"⚡ Scanning {len(universe):,} stocks..."):
-                    bo_df, bo_funnel = run_blast_screener(
+                with st.spinner(f"🔍 Screening {len(universe):,} stocks..."):
+                    ev_df, ev_funnel = run_earnings_value_screener(
                         universe=universe,
-                        timeframe_label=timeframe_label,
-                        direction=direction,
-                        rsi_len=rsi_len,
-                        vol_ma_len=vol_ma_len,
-                        mom_len=mom_len,
-                        sensitivity=sensitivity,
-                        vol_mult=vol_mult,
-                        rsi_bull=rsi_bull,
-                        rsi_bear=rsi_bear,
-                        score_floor=score_floor,
-                        min_score=min_score,
-                        spike_only=spike_only,
+                        near_high_pct=near_high_pct,
+                        min_upside=min_upside,
+                        earnings_mode=earnings_mode,
+                        upcoming_days=upcoming_days,
+                        reported_days=reported_days,
                         min_price=min_price,
                         min_avg_volume=min_avg_volume,
                         max_results=max_results,
-                        final_rank=final_rank,
-                        include_valuation=include_valuation
+                        max_valuation_calls=max_valuation_calls,
+                        final_rank=final_rank
                     )
                 
-                st.session_state['breakout_results'] = bo_df
-                st.session_state['breakout_funnel'] = bo_funnel
-                st.session_state['breakout_meta'] = {
-                    'timeframe': timeframe_label,
-                    'direction': direction,
-                    'universe_label': universe_label
+                st.session_state['ev_results'] = ev_df
+                st.session_state['ev_funnel'] = ev_funnel
+                st.session_state['ev_meta'] = {
+                    'universe_label': universe_label,
+                    'earnings_choice': earnings_choice,
+                    'near_high_pct': near_high_pct,
+                    'min_upside': min_upside
                 }
         
         # ---------------- Render results ----------------
-        bo_df = st.session_state.get('breakout_results')
-        bo_meta = st.session_state.get('breakout_meta', {})
-        bo_funnel = st.session_state.get('breakout_funnel', {})
+        ev_df = st.session_state.get('ev_results')
+        ev_meta = st.session_state.get('ev_meta', {})
+        ev_funnel = st.session_state.get('ev_funnel', {})
         
-        if bo_df is not None:
-            if bo_funnel:
-                f1, f2, f3, f4 = st.columns(4)
-                f1.metric("Scanned", bo_funnel.get('scanned', 0))
-                f2.metric("Had Data", bo_funnel.get('with_data', 0))
-                f3.metric("Blast Firing", bo_funnel.get('blast', 0))
-                f4.metric("Spikes", bo_funnel.get('spike', 0))
+        if ev_df is not None:
+            if ev_funnel:
+                st.markdown("##### 🔻 Funnel")
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Scanned", ev_funnel.get('scanned', 0))
+                c2.metric("Had Data", ev_funnel.get('with_data', 0))
+                c3.metric("Near 52W High", ev_funnel.get('near_high', 0))
+                c4.metric("Undervalued", ev_funnel.get('undervalued', 0))
+                c5.metric("Earnings Match", ev_funnel.get('earnings_ok', 0))
             
-            if bo_df.empty:
+            if ev_df.empty:
                 st.warning(
-                    "❌ No blasts firing right now. This is normal — the blast condition "
-                    "requires four things to be true simultaneously and can go long stretches "
-                    "without triggering, especially outside market hours. Try a wider universe, "
-                    "a lower volume multiplier, or a lower sensitivity."
+                    "❌ Nothing passed all three filters. The binding constraint is usually "
+                    "the combination of *undervalued* and *near the 52-week high* — those two "
+                    "pull against each other. Widen the 52-week band, lower the minimum "
+                    "upside, or check the funnel above to see which stage emptied out."
                 )
             else:
                 st.markdown(f'''
                 <div class="success-message">
-                    ✅ <strong>{len(bo_df)}</strong> {bo_meta.get('direction', direction).lower()}
-                    signals on the <strong>{bo_meta.get('timeframe', timeframe_label)}</strong> chart<br>
-                    🌐 Universe: {bo_meta.get('universe_label', universe_label)}
+                    ✅ <strong>{len(ev_df)}</strong> undervalued stocks near their 52-week high<br>
+                    📅 {ev_meta.get('earnings_choice', earnings_choice)}<br>
+                    🌐 Universe: {ev_meta.get('universe_label', universe_label)}
                 </div>
                 ''', unsafe_allow_html=True)
                 
-                s1, s2, s3, s4 = st.columns(4)
-                s1.metric("Signals", len(bo_df))
-                s2.metric("Avg Gamma", f"{bo_df['Gamma Score'].mean():.1f}")
-                s3.metric("Max Gamma", f"{bo_df['Gamma Score'].max():.1f}")
-                s4.metric("Spikes", int((bo_df['Signal'] == "💥 Spike").sum()))
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Results", len(ev_df))
+                m2.metric("Avg Upside", f"{ev_df['Upside %'].mean():+.1f}%")
+                m3.metric("Avg From High", f"{ev_df['From High %'].mean():.2f}%")
+                if 'Surprise %' in ev_df.columns and ev_df['Surprise %'].notna().any():
+                    m4.metric("Beats", int((ev_df['Surprise %'] > 0).sum()))
+                else:
+                    m4.metric("Beats", "N/A")
                 
-                bo_display = bo_df.copy()
+                ev_display = ev_df.copy()
                 
-                for col in ['LTP', 'Fair Value', 'VWAP']:
-                    if col in bo_display.columns:
-                        bo_display[col] = bo_display[col].apply(
+                for col in ['LTP', '52W High', 'Fair Value']:
+                    if col in ev_display.columns:
+                        ev_display[col] = ev_display[col].apply(
                             lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
                 
-                for col in ['Chg %', 'VWAP Dist %', 'Upside %', 'Momentum %']:
-                    if col in bo_display.columns:
-                        bo_display[col] = bo_display[col].apply(
+                for col in ['Chg %', 'From High %', 'Upside %', 'From Low %']:
+                    if col in ev_display.columns:
+                        ev_display[col] = ev_display[col].apply(
                             lambda x: f"{x:+.2f}%" if pd.notna(x) else 'N/A')
                 
-                for col in ['Gamma Score', 'Vol Term', 'Mom Term', 'Exp Term']:
-                    if col in bo_display.columns:
-                        bo_display[col] = bo_display[col].apply(
-                            lambda x: f"{x:.1f}" if pd.notna(x) else 'N/A')
-                
-                if 'Blast Rank' in bo_display.columns:
-                    bo_display['Blast Rank'] = bo_display['Blast Rank'].apply(
-                        lambda x: f"{x:.0f}%ile" if pd.notna(x) else 'N/A')
-                for col in ['Vol Ratio', 'Vol Expansion']:
-                    if col in bo_display.columns:
-                        bo_display[col] = bo_display[col].apply(
-                            lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
-                if 'RSI' in bo_display.columns:
-                    bo_display['RSI'] = bo_display['RSI'].apply(
-                        lambda x: f"{x:.1f}" if pd.notna(x) else 'N/A')
-                if 'ATR %' in bo_display.columns:
-                    bo_display['ATR %'] = bo_display['ATR %'].apply(
-                        lambda x: f"{x:.2f}%" if pd.notna(x) else 'N/A')
-                if 'PE Ratio' in bo_display.columns:
-                    bo_display['PE Ratio'] = bo_display['PE Ratio'].apply(
+                for col in ['Volume', 'Avg Volume']:
+                    if col in ev_display.columns:
+                        ev_display[col] = ev_display[col].apply(format_volume)
+                if 'Rel Vol' in ev_display.columns:
+                    ev_display['Rel Vol'] = ev_display['Rel Vol'].apply(
                         lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
+                if 'PE Ratio' in ev_display.columns:
+                    ev_display['PE Ratio'] = ev_display['PE Ratio'].apply(
+                        lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
+                if 'Market Cap' in ev_display.columns:
+                    ev_display['Market Cap'] = ev_display['Market Cap'].apply(
+                        lambda x: f"₹{x/10000000:,.0f}Cr" if pd.notna(x) else 'N/A')
+                for col in ['Days To', 'Days Since']:
+                    if col in ev_display.columns:
+                        ev_display[col] = ev_display[col].apply(
+                            lambda x: f"{int(x)}d" if pd.notna(x) else 'N/A')
                 
-                for col in ['Volume', 'Avg Volume', 'Session Volume']:
-                    if col in bo_display.columns:
-                        bo_display[col] = bo_display[col].apply(format_volume)
-                
-                bo_columns = ['Ticker', 'Name', 'Timeframe', 'LTP', 'Fair Value', 'Upside %',
-                              'Value Tag', 'Signal', 'Stage', 'Gamma Score', 'Blast Rank',
-                              'Chg %', 'Vol Ratio', 'Volume', 'Avg Volume', 'Session Volume',
-                              'Momentum %', 'Vol Expansion', 'RSI', 'ATR %',
-                              'VWAP', 'VWAP Dist %', 'Streak', 'Blasts/100',
-                              'PE Ratio', 'Cap Type', 'Last Candle', 'Valuation']
-                bo_columns = [c for c in bo_columns if c in bo_display.columns]
+                ev_columns = ['Ticker', 'Name', 'LTP', 'From High %', '52W High',
+                              'Fair Value', 'Upside %', 'Value Tag',
+                              'Earnings', 'Last Earnings', 'Days Since', 'Last Surprise',
+                              'Next Earnings', 'Days To',
+                              'Volume', 'Avg Volume', 'Rel Vol', 'Chg %',
+                              'PE Ratio', 'Cap Type', 'As Of', 'Valuation']
+                ev_columns = [c for c in ev_columns if c in ev_display.columns]
                 
                 st.dataframe(
-                    bo_display[bo_columns],
+                    ev_display[ev_columns],
                     use_container_width=True,
                     hide_index=True,
-                    height=min(600, len(bo_display) * 35 + 100),
+                    height=min(600, len(ev_display) * 35 + 100),
                     column_config=valuation_column_config()
                 )
                 
-                render_valuation_jump(bo_df, "breakout_screener")
+                render_valuation_jump(ev_df, "earnings_value")
                 
-                with st.expander("🔬 Score decomposition"):
-                    st.caption("Which of the three terms is carrying the score. A blast built "
-                               "almost entirely on the volume term is a different event from one "
-                               "built on volatility expansion.")
-                    d_cols = ['Ticker', 'Gamma Score', 'Vol Term', 'Mom Term', 'Exp Term',
-                              'Blast Rank', 'Streak', 'Blasts/100']
-                    d_cols = [c for c in d_cols if c in bo_df.columns]
-                    st.dataframe(bo_df[d_cols], use_container_width=True, hide_index=True)
+                with st.expander("📅 Earnings detail"):
+                    st.caption("A positive last surprise is what post-earnings drift follows. "
+                               "An upcoming date inside your intended holding period is gap risk.")
+                    e_cols = ['Ticker', 'Last Earnings', 'Days Since', 'Last Surprise',
+                              'Next Earnings', 'Days To', 'Upside %', 'From High %']
+                    e_cols = [c for c in e_cols if c in ev_df.columns]
+                    st.dataframe(ev_df[e_cols], use_container_width=True, hide_index=True)
                 
-                if 'Fair Value' in bo_df.columns and bo_df['Fair Value'].notna().any():
-                    with st.expander("💰 Valuation detail"):
-                        st.caption("Context only — none of these figures filtered any stock out.")
-                        q_cols = ['Ticker', 'LTP', 'Fair Value', 'Upside %', 'Value Tag',
-                                  'PE Ratio', 'Cap Type']
-                        q_cols = [c for c in q_cols if c in bo_df.columns]
-                        st.dataframe(bo_df[q_cols], use_container_width=True, hide_index=True)
-                
-                bo_csv = bo_df.to_csv(index=False)
-                bo_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                bo_tf = bo_meta.get('timeframe', timeframe_label).replace(' ', '')
+                ev_csv = ev_df.to_csv(index=False)
+                ev_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                 st.download_button(
-                    f"📥 Download Blast Results ({len(bo_df)} stocks)",
-                    data=bo_csv,
-                    file_name=f"NYZTrade_GammaBlast_{bo_tf}_{bo_ts}.csv",
+                    f"📥 Download Results ({len(ev_df)} stocks)",
+                    data=ev_csv,
+                    file_name=f"NYZTrade_EarningsValue_{ev_ts}.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
