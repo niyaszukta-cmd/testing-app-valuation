@@ -1066,7 +1066,8 @@ def get_stock_fundamentals(ticker):
             'revenue': info.get('totalRevenue'),
             'sector': info.get('sector', 'Other'),
             'industry': info.get('industry', 'Other'),
-            # Growth / profitability fields used by the breakout quality gate
+            # Growth / profitability fields (available for future use and for
+            # the Individual Analysis screen; the breakout screener does not filter on them)
             'earnings_growth': info.get('earningsGrowth') or info.get('earningsQuarterlyGrowth'),
             'revenue_growth': info.get('revenueGrowth'),
             'operating_margin': info.get('operatingMargins'),
@@ -1437,9 +1438,13 @@ def search_stocks_by_name(query, max_results=50):
 # its level by 0.6 ATR on 3x volume out of a 40-bar base should not score the
 # same as one that clears by 0.02 ATR on 1.5x volume out of a 6-bar base.
 #
-# Structural conditions - trend alignment, liquidity, profitability - are HARD
-# GATES rather than score contributors. A breakout against the daily trend is
-# not "a slightly lower score", it is a different (and worse) trade.
+# Structural conditions - trend alignment, volume, liquidity - are HARD GATES
+# rather than score contributors. A breakout against the daily trend is not
+# "a slightly lower score", it is a different (and worse) trade.
+#
+# The screener is PURELY TECHNICAL. Fair Value and Upside are fetched for
+# display so you can see what you are buying, but no fundamental figure is
+# ever allowed to remove a valid technical setup from the results.
 # ============================================================================
 
 # Timeframe configuration for intraday screening
@@ -2044,208 +2049,6 @@ def score_breakout(feat, direction="Bullish Breakout", rel_vol_threshold=1.5,
 
 
 # ---------------------------------------------------------------------------
-# FUNDAMENTAL QUALITY GATE (earnings / profitability)
-# ---------------------------------------------------------------------------
-# Presets. "Balanced" is the default because the Indian mid/small-cap universe
-# has patchy fundamental coverage on Yahoo, and because perfectly normal Indian
-# businesses - PSUs on 9% ROE, infra names on 260 D/E - are not low quality,
-# they are just capital-intensive.
-# FETCHING fundamentals and FILTERING on them are separate decisions. Earlier
-# these were welded together, so switching the filter off to recover results
-# also blanked the Fair Value, Upside and Quality columns - exactly the data
-# needed to judge whatever did come back.
-#
-# 'fetch'  - retrieve fundamentals at all (off = fastest scan, no valuation)
-# 'filter' - allow fundamentals to REMOVE a stock from the results
-#
-# The default now fetches everything and filters nothing: quality and upside
-# are shown and can drive ranking, but never silently empty out an industry.
-QUALITY_PRESETS = {
-    "Show only — never filters (default)": {
-        'fetch': True, 'filter': False,
-        'min_quality_score': 0, 'exclude_loss_making': False, 'include_no_data': True,
-        'min_roe': None, 'max_de': None, 'min_earnings_growth': None,
-    },
-    "Lenient — drop only loss-makers": {
-        'fetch': True, 'filter': True,
-        'min_quality_score': 0, 'exclude_loss_making': True, 'include_no_data': True,
-        'min_roe': None, 'max_de': None, 'min_earnings_growth': None,
-    },
-    "Balanced": {
-        'fetch': True, 'filter': True,
-        'min_quality_score': 28, 'exclude_loss_making': True, 'include_no_data': True,
-        'min_roe': None, 'max_de': 800, 'min_earnings_growth': None,
-    },
-    "Strict — quality compounders": {
-        'fetch': True, 'filter': True,
-        'min_quality_score': 55, 'exclude_loss_making': True, 'include_no_data': False,
-        'min_roe': 10, 'max_de': 250, 'min_earnings_growth': None,
-    },
-    "Skip fundamentals (fastest scan)": {
-        'fetch': False, 'filter': False,
-    },
-}
-
-
-def split_quality_preset(params):
-    """Separate the fetch/filter flags from the compute_quality() keyword args"""
-    p = dict(params or {})
-    fetch = p.pop('fetch', True)
-    filt = p.pop('filter', False)
-    return fetch, filt, p
-
-# Weight of each metric in the quality score. The score is normalised by the
-# weight of the metrics ACTUALLY AVAILABLE, so a company with only two fields
-# populated is judged on those two rather than being scored out of 100 and
-# tagged weak for Yahoo's missing data.
-QUALITY_WEIGHTS = {'eps': 25, 'roe': 30, 'margin': 20, 'growth': 15, 'de': 10}
-
-
-def _as_pct(x):
-    """yfinance returns ratios as fractions (0.18) but occasionally as percents."""
-    if x is None or pd.isna(x):
-        return None
-    return float(x) * 100 if abs(float(x)) <= 5 else float(x)
-
-
-def compute_quality(fundamentals, min_quality_score=35, exclude_loss_making=True,
-                    include_no_data=True, min_roe=None, max_de=500,
-                    min_earnings_growth=None):
-    """
-    Profitability screen for breakout candidates.
-
-    Three design rules learned the hard way:
-
-    1. MISSING DATA IS NOT A FAILURE. Yahoo often has no trailingEps for Indian
-       mid and small caps. Treating absent fields as zeros rejected good
-       businesses and emptied out whole industries. Absent metrics are now
-       excluded from the calculation instead of scored as zero.
-
-    2. THE SCORE IS COVERAGE-NORMALISED. A stock with only EPS and ROE present
-       is scored on EPS and ROE, not out of a fixed 100 it can never reach.
-
-    3. ONE SOFT GATE, NOT SIX HARD ONES. Requiring EPS>0 AND ROE>=10 AND
-       margin>0 AND D/E<=200 simultaneously is a very narrow intersection.
-       Metrics now feed a single composite score with one threshold, so
-       strength in one area can offset an ordinary reading elsewhere.
-       Only loss-making is a genuine hard exclusion, and only when the data
-       actually says so.
-    """
-    if not fundamentals:
-        return {'passed': bool(include_no_data), 'score': None, 'coverage': 0.0,
-                'tag': '❔ No Data', 'reasons': ['No fundamental data available'],
-                'drop_reason': None if include_no_data else 'no_data',
-                'roe_pct': None, 'margin_pct': None, 'growth_pct': None,
-                'de': None, 'eps': None}
-
-    eps = fundamentals.get('trailing_eps')
-    roe_pct = _as_pct(fundamentals.get('roe'))
-    margin_pct = _as_pct(fundamentals.get('profit_margin'))
-    growth_pct = _as_pct(fundamentals.get('earnings_growth'))
-    de = fundamentals.get('debt_to_equity')
-
-    sector = (fundamentals.get('sector') or '').lower()
-    industry = (fundamentals.get('industry') or '').lower()
-    is_financial = any(k in sector or k in industry for k in
-                       ['financial', 'bank', 'insurance', 'capital market', 'credit'])
-
-    # ---- Coverage-normalised composite score ------------------------------
-    got = []   # (weight, 0..1 score)
-    if eps is not None and not pd.isna(eps):
-        got.append((QUALITY_WEIGHTS['eps'], 1.0 if eps > 0 else 0.0))
-    if roe_pct is not None:
-        got.append((QUALITY_WEIGHTS['roe'], _clip01(roe_pct / 20.0)))
-    if margin_pct is not None:
-        got.append((QUALITY_WEIGHTS['margin'], _clip01(margin_pct / 15.0)))
-    if growth_pct is not None:
-        got.append((QUALITY_WEIGHTS['growth'], _clip01((growth_pct + 10) / 40.0)))
-    if de is not None and not pd.isna(de) and not is_financial:
-        got.append((QUALITY_WEIGHTS['de'], _clip01((350 - de) / 350.0)))
-
-    total_w = sum(w for w, _ in got)
-    coverage = total_w / sum(QUALITY_WEIGHTS.values())
-
-    if total_w == 0:
-        score = None
-    else:
-        raw = 100.0 * sum(w * s for w, s in got) / total_w
-        # Shrink thin-coverage scores toward a neutral 50. Without this, a stock
-        # whose ONLY available metric is a positive EPS scores a perfect 100 and
-        # outranks a fully-documented compounder. Confidence should scale with
-        # how much we actually know.
-        if coverage < 0.6:
-            k = coverage / 0.6
-            raw = raw * k + 50.0 * (1 - k)
-        score = round(raw)
-
-    reasons = []
-    drop_reason = None
-    passed = True
-
-    # ---- Hard exclusion: only where the data positively says so -----------
-    if exclude_loss_making and eps is not None and not pd.isna(eps) and eps <= 0:
-        passed, drop_reason = False, 'loss_making'
-        reasons.append(f"Loss-making (EPS {eps:.2f})")
-    elif exclude_loss_making and margin_pct is not None and margin_pct <= -5:
-        passed, drop_reason = False, 'loss_making'
-        reasons.append(f"Negative margin ({margin_pct:.1f}%)")
-
-    # ---- Optional explicit floors (off in every preset except Strict) -----
-    if passed and min_roe is not None and roe_pct is not None and roe_pct < min_roe:
-        passed, drop_reason = False, 'below_floor'
-        reasons.append(f"ROE {roe_pct:.1f}% < {min_roe:.0f}%")
-    if passed and max_de is not None and de is not None and not is_financial and de > max_de:
-        passed, drop_reason = False, 'below_floor'
-        reasons.append(f"D/E {de:.0f} > {max_de:.0f}")
-    if passed and min_earnings_growth is not None and growth_pct is not None \
-            and growth_pct < min_earnings_growth:
-        passed, drop_reason = False, 'below_floor'
-        reasons.append(f"Earnings growth {growth_pct:.1f}% < {min_earnings_growth:.0f}%")
-
-    # ---- Soft gate on the composite score ---------------------------------
-    if passed:
-        if score is None:
-            passed = bool(include_no_data)
-            drop_reason = None if passed else 'no_data'
-            reasons.append("No fundamental metrics available"
-                           + ("" if passed else " — excluded by setting"))
-        elif score < min_quality_score:
-            passed, drop_reason = False, 'below_score'
-            reasons.append(f"Quality score {score:.0f} < {min_quality_score:.0f}")
-
-    if not reasons:
-        bits = []
-        if roe_pct is not None:
-            bits.append(f"ROE {roe_pct:.1f}%")
-        if margin_pct is not None:
-            bits.append(f"margin {margin_pct:.1f}%")
-        if de is not None and not is_financial:
-            bits.append(f"D/E {de:.0f}")
-        reasons.append("Passes: " + (", ".join(bits) if bits else "profitable"))
-
-    if score is None:
-        tag = "❔ Limited Data"
-    elif score >= 75:
-        tag = "💎 High Quality"
-    elif score >= 55:
-        tag = "✅ Quality"
-    elif score >= 35:
-        tag = "🟡 Average"
-    else:
-        tag = "⚠️ Weak"
-
-    if score is not None and coverage < 0.4:
-        tag += " *"     # thin data — score is based on few metrics
-
-    return {
-        'passed': passed, 'score': score, 'coverage': round(coverage, 2),
-        'tag': tag, 'reasons': reasons, 'drop_reason': drop_reason,
-        'roe_pct': roe_pct, 'margin_pct': margin_pct, 'growth_pct': growth_pct,
-        'de': de, 'eps': eps,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Valuation enrichment (fair value + upside %)
 # ---------------------------------------------------------------------------
 def get_valuation_tag(upside):
@@ -2263,12 +2066,15 @@ def get_valuation_tag(upside):
     return "⚠️ Overvalued"
 
 
-def enrich_with_fundamentals(rows, quality_params, show_progress=True):
+def enrich_with_valuation(rows, show_progress=True):
     """
-    Attach fair value, upside and the profitability screen to breakout candidates.
+    Attach fair value and upside to breakout candidates.
 
-    Runs only on stocks that already cleared the technical and trend gates, so
-    the extra yfinance calls stay small. fetch_stock_data() is cached one hour.
+    DISPLAY ONLY. Nothing here can remove a stock from the results - the
+    screener is purely technical, and these columns exist so you can see what
+    you are buying, not to veto a valid setup. Runs after the technical and
+    trend gates, so the per-ticker calls only touch survivors, and
+    fetch_stock_data() is cached for an hour.
     """
     if not rows:
         return rows
@@ -2282,18 +2088,15 @@ def enrich_with_fundamentals(rows, quality_params, show_progress=True):
         if show_progress:
             try:
                 progress_bar.progress(min((n + 1) / total, 1.0))
-                status_text.text(f"💰 Checking fundamentals... {n + 1}/{total} — {ticker}")
+                status_text.text(f"💰 Fetching fair value... {n + 1}/{total} — {ticker}")
             except Exception:
                 pass
 
         fair_value = upside = pe_ratio = market_cap = cap_type = None
-        quality = compute_quality(None, **quality_params)
 
         try:
             fundamentals = get_stock_fundamentals(ticker)
             if fundamentals and fundamentals.get('price'):
-                quality = compute_quality(fundamentals, **quality_params)
-
                 stock_info = get_stock_info(ticker)
                 industry = stock_info['category'] if stock_info else fundamentals.get('industry', 'Other')
                 cap_type = fundamentals.get('cap_type', 'Large')
@@ -2312,15 +2115,6 @@ def enrich_with_fundamentals(rows, quality_params, show_progress=True):
         row['Fair Value'] = fair_value
         row['Upside %'] = upside
         row['Value Tag'] = get_valuation_tag(upside)
-        row['Quality'] = quality['tag']
-        row['Quality Score'] = quality['score']
-        row['Quality Passed'] = quality['passed']
-        row['Quality Drop'] = quality.get('drop_reason')
-        row['Data Coverage'] = quality.get('coverage')
-        row['Quality Notes'] = "; ".join(quality['reasons'])
-        row['ROE %'] = quality.get('roe_pct')
-        row['Margin %'] = quality.get('margin_pct')
-        row['EPS'] = quality.get('eps')
         row['PE Ratio'] = pe_ratio
         row['Market Cap'] = market_cap
         row['Cap Type'] = cap_type
@@ -2342,28 +2136,23 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
                           rel_vol_threshold=1.5, min_price=10.0, min_avg_volume=25000,
                           donchian_len=20, min_score=55, max_results=40, chunk_size=25,
                           trend_mode="Strict (HTF + Daily)", veto_exhaustion=True,
-                          apply_quality=False, quality_params=None, min_upside=None,
-                          final_rank="Breakout Score", auto_relax=True, min_results_target=5,
-                          fetch_fundamentals=True):
+                          final_rank="Breakout Score", include_valuation=True):
     """
-    Four-stage funnel:
+    Purely technical three-stage funnel:
 
       1. Technical  - five-factor breakout score on the trading timeframe
       2. Trend      - multi-timeframe alignment gate (HTF + daily)
-      3. Quality    - profitability / earnings screen
-      4. Valuation  - fair value and upside
+      3. Valuation  - fair value and upside, DISPLAY ONLY
 
-    Each stage is cheaper to run than the next, so the expensive per-ticker
-    fundamental calls only ever touch a handful of survivors.
+    Stage 3 never removes a stock. Fundamentals are shown so you can judge
+    what broke out; they are not permitted to veto a valid technical setup.
     """
     cfg = INTRADAY_TIMEFRAMES.get(timeframe_label, INTRADAY_TIMEFRAMES["15 Minute"])
     bullish = direction.startswith("Bullish")
     tickers = list(universe.keys())
     total = len(tickers)
-    funnel = {'scanned': 0, 'broke_out': 0, 'trend_aligned': 0, 'quality_passed': 0,
-              'final': 0, 'no_daily_data': 0, 'relaxed_in': 0,
-              'quality_drops': {'loss_making': 0, 'below_score': 0,
-                                'below_floor': 0, 'no_data': 0}}
+    funnel = {'scanned': 0, 'broke_out': 0, 'trend_aligned': 0,
+              'final': 0, 'no_daily_data': 0}
 
     if total == 0:
         return pd.DataFrame(), funnel
@@ -2454,8 +2243,6 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
             'Fair Value': None,
             'Upside %': None,
             'Value Tag': None,
-            'Quality': None,
-            'Quality Score': None,
             'Day Chg %': feat['day_change_pct'],
             'Score': v['score'],
             'Setup': ("🆕 Fresh" if v['fresh'] else "🔁 Extended") +
@@ -2485,41 +2272,9 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
             'Valuation': build_valuation_link(c['ticker']),
         })
 
-    # ---------------- STAGE 3 + 4: fundamentals ----------------
-    # Fetch whenever fundamentals are wanted for DISPLAY, not only when they
-    # are used to filter. Enrichment on its own never removes a stock.
-    if fetch_fundamentals or apply_quality or min_upside is not None:
-        rows = enrich_with_fundamentals(rows, quality_params or {})
-
-        if apply_quality:
-            for r in rows:
-                d = r.get('Quality Drop')
-                if d in funnel['quality_drops']:
-                    funnel['quality_drops'][d] += 1
-
-            kept = [r for r in rows if r.get('Quality Passed')]
-
-            # Auto-relax: if the gate emptied the list, fill back up with the
-            # highest-scoring NEAR MISSES only. Stocks excluded outright (loss
-            # making, or an explicit floor) are never reinstated - relaxing the
-            # soft threshold must not quietly undo a hard exclusion.
-            if auto_relax and len(kept) < min_results_target:
-                near = [r for r in rows
-                        if not r.get('Quality Passed')
-                        and r.get('Quality Drop') in ('below_score', 'no_data')]
-                near.sort(key=lambda r: (r.get('Quality Score') or 0), reverse=True)
-                fill = near[:max(0, min_results_target - len(kept))]
-                for r in fill:
-                    r['Quality'] = "➖ Relaxed"
-                    r['Quality Notes'] = "Included by auto-relax — " + str(r.get('Quality Notes', ''))
-                funnel['relaxed_in'] = len(fill)
-                kept = kept + fill
-
-            rows = kept
-
-        funnel['quality_passed'] = len(rows) if apply_quality else None
-        if min_upside is not None:
-            rows = [r for r in rows if r.get('Upside %') is not None and r['Upside %'] >= min_upside]
+    # ---------------- STAGE 3: valuation (display only) ----------------
+    if include_valuation:
+        rows = enrich_with_valuation(rows)
 
     df_out = pd.DataFrame(rows)
     if df_out.empty:
@@ -2530,11 +2285,7 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
         return df_out, funnel
 
     # ---------------- Final ranking ----------------
-    if final_rank == "Breakout + Quality" and 'Quality Score' in df_out.columns:
-        df_out['Combined'] = (df_out['Score'].fillna(0) * 0.65
-                              + df_out['Quality Score'].fillna(0) * 0.35)
-        df_out = df_out.sort_values('Combined', ascending=False)
-    elif final_rank == "Upside %" and 'Upside %' in df_out.columns:
+    if final_rank == "Upside %" and 'Upside %' in df_out.columns:
         df_out = df_out.sort_values('Upside %', ascending=False, na_position='last')
     else:
         df_out = df_out.sort_values(['Score', 'Rel Vol'], ascending=[False, False])
@@ -3129,7 +2880,7 @@ def main():
         
         st.markdown("### ⚡ Multi-Timeframe Breakout Screener")
         st.caption("Trades the 15m / 1H chart, but only in stocks already trending on the "
-                   "higher timeframe and passing a profitability screen.")
+                   "higher timeframe. Purely technical — fundamentals are shown, never filtered on.")
         
         # ---------------- Sidebar controls ----------------
         st.sidebar.markdown("### ⏱️ Timeframe & Direction")
@@ -3203,85 +2954,23 @@ def main():
         min_avg_volume = st.sidebar.number_input("Min Avg Bar Volume", min_value=0, value=25000, step=5000)
         max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="bo_max_results")
         
-        st.sidebar.markdown("### 💰 Fundamentals")
-        quality_preset = st.sidebar.selectbox(
-            "Fundamental Handling",
-            list(QUALITY_PRESETS.keys()) + ["Custom"],
-            index=0,
-            help="The default shows Quality, Fair Value and Upside on every result but never "
-                 "removes a stock. Move down the list only if you want fundamentals to "
-                 "actually filter."
+        st.sidebar.markdown("### 💰 Valuation (display only)")
+        include_valuation = st.sidebar.checkbox(
+            "Show Fair Value & Upside %", value=True,
+            help="Adds Fair Value, Upside % and PE to the results table. These are "
+                 "informational only — they never filter a stock out. Untick for the "
+                 "fastest possible scan."
         )
-        
-        fetch_fundamentals = True
-        apply_quality = False
-        quality_params = {}
-        
-        if quality_preset != "Custom":
-            fetch_fundamentals, apply_quality, quality_params = split_quality_preset(
-                QUALITY_PRESETS[quality_preset])
-            if not fetch_fundamentals:
-                st.sidebar.caption("⚡ Fastest scan — no Fair Value, Upside or Quality columns.")
-            elif not apply_quality:
-                st.sidebar.caption("👁️ Shown for ranking only — nothing is filtered out.")
-            else:
-                _p = quality_params
-                st.sidebar.caption(
-                    f"Min score **{_p['min_quality_score']}** · "
-                    f"loss-making **{'excluded' if _p['exclude_loss_making'] else 'allowed'}** · "
-                    f"no-data stocks **{'kept' if _p['include_no_data'] else 'dropped'}**"
-                )
+        if include_valuation:
+            st.sidebar.caption("👁️ Shown for context and ranking — nothing is filtered out.")
         else:
-            apply_quality = st.sidebar.checkbox(
-                "Let fundamentals filter results", value=False,
-                help="Leave this off to show fundamentals without removing anything."
-            )
-            if apply_quality:
-                quality_params['min_quality_score'] = st.sidebar.slider(
-                    "Min Quality Score", 0, 100, 25, 5,
-                    help="Composite of EPS, ROE, margin, growth and leverage — normalised "
-                         "by whichever metrics are actually available."
-                )
-                quality_params['exclude_loss_making'] = st.sidebar.checkbox(
-                    "Exclude loss-making companies", value=True,
-                    help="Only excludes stocks whose data positively shows a loss. "
-                         "Stocks with no EPS data are handled by the setting below."
-                )
-                quality_params['include_no_data'] = st.sidebar.checkbox(
-                    "Keep stocks with no fundamental data", value=True,
-                    help="Yahoo has patchy coverage of Indian mid and small caps. Unticking "
-                         "this drops them entirely, which empties out many industries."
-                )
-                _roe_on = st.sidebar.checkbox("Apply a hard ROE floor", value=False)
-                quality_params['min_roe'] = st.sidebar.slider("Min ROE %", 0, 30, 10) if _roe_on else None
-                _de_on = st.sidebar.checkbox("Apply a hard D/E ceiling", value=False)
-                quality_params['max_de'] = st.sidebar.slider(
-                    "Max Debt / Equity", 50, 800, 500, 25,
-                    help="Skipped automatically for banks, NBFCs and insurers."
-                ) if _de_on else None
-                _g_on = st.sidebar.checkbox("Require earnings growth", value=False)
-                quality_params['min_earnings_growth'] = st.sidebar.slider(
-                    "Min Earnings Growth %", -20, 50, 0, 5) if _g_on else None
-        
-        if apply_quality:
-            auto_relax = st.sidebar.checkbox(
-                "Auto-relax if too few results", value=True,
-                help="If the quality gate leaves almost nothing, the best near-misses are added "
-                     "back and tagged. Loss-making stocks are never reinstated this way."
-            )
-            min_results_target = st.sidebar.slider("Relax until at least", 1, 20, 8) if auto_relax else 5
-        else:
-            auto_relax, min_results_target = True, 5
-        
-        min_upside = None
-        _apply_upside = st.sidebar.checkbox("Only undervalued breakouts", value=False)
-        if _apply_upside:
-            min_upside = st.sidebar.slider("Min Upside %", -20, 100, 15, 5)
+            st.sidebar.caption("⚡ Fastest scan — pure technicals, no valuation columns.")
         
         final_rank = st.sidebar.selectbox(
             "Rank results by",
-            ["Breakout Score", "Breakout + Quality", "Upside %"],
-            help="'Breakout + Quality' blends the technical score (65%) with the quality score (35%)."
+            ["Breakout Score", "Upside %"],
+            help="Ranking by Upside %% only re-orders the same technical results — "
+                 "it never removes a setup."
         )
         
         with st.expander("📚 Why only five criteria?"):
@@ -3303,8 +2992,8 @@ of each other as possible:
 | **{BREAKOUT_FACTORS['entry_efficiency']['label']}** | {BREAKOUT_FACTORS['entry_efficiency']['weight']} | {BREAKOUT_FACTORS['entry_efficiency']['desc']} |
 | **{BREAKOUT_FACTORS['momentum_align']['label']}** | {BREAKOUT_FACTORS['momentum_align']['weight']} | {BREAKOUT_FACTORS['momentum_align']['desc']} |
 
-**Structural conditions are gates, not points.** Trend alignment, volume confirmation, liquidity and
-profitability either pass or the stock is dropped. A breakout against the daily trend is not
+**Structural conditions are gates, not points.** Trend alignment, volume confirmation and liquidity
+either pass or the stock is dropped. A breakout against the daily trend is not
 "a slightly lower score" — it is a different and worse trade, so no amount of chart beauty should
 let it through.
 
@@ -3312,8 +3001,9 @@ let it through.
 screeners rank the biggest movers to the top, which is precisely the list of stocks you are too
 late to buy.
 
-**The scan runs as a funnel:** technical → trend → quality → valuation. Each stage is more expensive
-than the last, so the per-stock fundamental calls only ever touch a handful of survivors.
+**The scan runs as a funnel:** technical → trend → valuation. Each stage is more expensive than the
+last, so the per-stock valuation calls only ever touch a handful of survivors. The valuation stage
+is display-only — it labels what came through, it never removes anything.
             """)
         
         if st.sidebar.button("⚡ Run Breakout Scan", type="primary"):
@@ -3343,13 +3033,8 @@ than the last, so the per-stock fundamental calls only ever touch a handful of s
                         max_results=max_results,
                         trend_mode=trend_mode,
                         veto_exhaustion=veto_exhaustion,
-                        apply_quality=apply_quality,
-                        fetch_fundamentals=fetch_fundamentals,
-                        quality_params=quality_params,
-                        min_upside=min_upside,
                         final_rank=final_rank,
-                        auto_relax=auto_relax,
-                        min_results_target=min_results_target
+                        include_valuation=include_valuation
                     )
                 
                 st.session_state['breakout_results'] = bo_df
@@ -3369,35 +3054,18 @@ than the last, so the per-stock fundamental calls only ever touch a handful of s
         
         if funnel:
             st.markdown("##### 🔻 Screening Funnel")
-            f1, f2, f3, f4, f5 = st.columns(5)
+            f1, f2, f3, f4 = st.columns(4)
             f1.metric("Scanned", funnel.get('scanned', 0))
             f2.metric("Broke Out", funnel.get('broke_out', 0))
             f3.metric("Trend Aligned", funnel.get('trend_aligned', 0))
-            _qp = funnel.get('quality_passed')
-            f4.metric("Quality Passed", _qp if _qp is not None else "n/a")
-            if _qp is None:
-                f4.caption("filter off")
-            f5.metric("Final", funnel.get('final', 0))
+            f4.metric("Final", funnel.get('final', 0))
             
-            _qd = funnel.get('quality_drops', {})
-            if sum(_qd.values()) > 0:
-                _bits = []
-                if _qd.get('loss_making'): _bits.append(f"{_qd['loss_making']} loss-making")
-                if _qd.get('below_score'): _bits.append(f"{_qd['below_score']} below quality score")
-                if _qd.get('below_floor'): _bits.append(f"{_qd['below_floor']} below a hard floor")
-                if _qd.get('no_data'):     _bits.append(f"{_qd['no_data']} no fundamental data")
-                st.caption("Dropped at the fundamental stage: " + ", ".join(_bits))
-            if funnel.get('relaxed_in'):
-                st.info(f"➖ Auto-relax added back {funnel['relaxed_in']} near-miss "
-                        f"stock(s), tagged **➖ Relaxed** in the table. Loss-making companies "
-                        f"were not reinstated.")
             if funnel.get('no_daily_data'):
                 st.caption(f"⚠️ {funnel['no_daily_data']} candidate(s) had no daily history "
                            f"returned — a data issue rather than a strict filter.")
         
         if bo_df is not None:
             if bo_df.empty:
-                _qd = (funnel or {}).get('quality_drops', {})
                 _f = funnel or {}
                 if _f.get('broke_out', 0) == 0:
                     _tip = ("Nothing broke out. Lower **Min Relative Volume**, shorten the "
@@ -3405,9 +3073,9 @@ than the last, so the per-stock fundamental calls only ever touch a handful of s
                 elif _f.get('trend_aligned', 0) == 0:
                     _tip = ("Breakouts were found but none aligned with the higher timeframe. "
                             "Switch **Multi-Timeframe Alignment** to *Daily Trend Only* or *Off*.")
-                elif sum(_qd.values()) > 0:
-                    _tip = ("Candidates were dropped at the fundamental stage. Set "
-                            "**Fundamental Handling** back to *Show only — never filters*.")
+                elif _f.get('final', 0) == 0:
+                    _tip = ("Trend-aligned breakouts were found but none cleared "
+                            "**Min Composite Score**. Lower it to see the weaker setups.")
                 else:
                     _tip = "Try lowering **Min Composite Score**."
                 st.warning("❌ No setups survived the funnel. " + _tip)
@@ -3423,18 +3091,14 @@ than the last, so the per-stock fundamental calls only ever touch a handful of s
                 </div>
                 ''', unsafe_allow_html=True)
                 
-                s1, s2, s3, s4, s5 = st.columns(5)
+                s1, s2, s3, s4 = st.columns(4)
                 s1.metric("Avg Score", f"{bo_df['Score'].mean():.0f}")
                 s2.metric("Avg Rel Vol", f"{bo_df['Rel Vol'].mean():.2f}x")
                 s3.metric("Fresh Breaks", int(bo_df['Setup'].str.contains('Fresh').sum()))
-                if 'Quality Score' in bo_df.columns and bo_df['Quality Score'].notna().any():
-                    s4.metric("Avg Quality", f"{bo_df['Quality Score'].dropna().mean():.0f}")
-                else:
-                    s4.metric("Avg Quality", "N/A")
                 if 'Upside %' in bo_df.columns and bo_df['Upside %'].notna().any():
-                    s5.metric("Avg Upside", f"{bo_df['Upside %'].dropna().mean():+.1f}%")
+                    s4.metric("Avg Upside", f"{bo_df['Upside %'].dropna().mean():+.1f}%")
                 else:
-                    s5.metric("Avg Upside", "N/A")
+                    s4.metric("Avg Upside", "N/A")
                 
                 bo_display = bo_df.copy()
                 _htf_col = f"{bo_meta.get('htf_label', _cfg['htf_label'])} Trend"
@@ -3472,10 +3136,10 @@ than the last, so the per-stock fundamental calls only ever touch a handful of s
                         lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
                 
                 bo_columns = ['Ticker', 'Name', 'Timeframe', 'LTP', 'Fair Value', 'Upside %',
-                              'Value Tag', 'Quality', 'Score', 'Setup', 'Daily Trend', _htf_col,
+                              'Value Tag', 'Score', 'Setup', 'Daily Trend', _htf_col,
                               'Breakout Level', 'Margin (ATR)', 'Volume', 'Rel Vol',
                               'Session Volume', 'VWAP', 'VWAP Dist %', 'RSI', 'ATR %',
-                              'ROE %', 'PE Ratio', 'Cap Type', 'Last Candle', 'Valuation']
+                              'PE Ratio', 'Cap Type', 'Last Candle', 'Valuation']
                 bo_columns = [c for c in bo_columns if c in bo_display.columns]
                 
                 st.dataframe(
@@ -3497,14 +3161,12 @@ than the last, so the per-stock fundamental calls only ever touch a handful of s
                     factor_cols = [c for c in factor_cols if c in bo_df.columns]
                     st.dataframe(bo_df[factor_cols], use_container_width=True, hide_index=True)
                 
-                if 'Quality Notes' in bo_df.columns:
-                    with st.expander("💰 Fundamental detail"):
-                        st.caption("A ' * ' on the quality tag means the score is based on "
-                                   "few available metrics. 'Data Coverage' shows the fraction "
-                                   "of fundamental fields Yahoo actually returned.")
-                        q_cols = ['Ticker', 'Quality', 'Quality Score', 'Data Coverage', 'EPS',
-                                  'ROE %', 'Margin %', 'PE Ratio', 'Fair Value', 'Upside %',
-                                  'Quality Notes']
+                if 'Fair Value' in bo_df.columns and bo_df['Fair Value'].notna().any():
+                    with st.expander("💰 Valuation detail"):
+                        st.caption("Context only — none of these figures filtered any stock "
+                                   "out of the list above.")
+                        q_cols = ['Ticker', 'LTP', 'Fair Value', 'Upside %', 'Value Tag',
+                                  'PE Ratio', 'Cap Type']
                         q_cols = [c for c in q_cols if c in bo_df.columns]
                         st.dataframe(bo_df[q_cols], use_container_width=True, hide_index=True)
                 
