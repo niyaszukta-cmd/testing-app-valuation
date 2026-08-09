@@ -11894,7 +11894,7 @@ def main():
             universe = dict(get_stocks_by_category(bo_industry))
             universe_label = bo_industry
             
-            scan_cap = st.sidebar.slider("Max stocks to scan", 20, 400, 120, step=20,
+            scan_cap = st.sidebar.slider("Max stocks to scan", 20, 1000, 120, step=20,
                                          help="Intraday data is heavy — cap the scan size to avoid rate limits")
             if len(universe) > scan_cap:
                 universe = dict(list(universe.items())[:scan_cap])
