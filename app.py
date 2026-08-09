@@ -1813,7 +1813,7 @@ def trend_gate_passes(daily_trend, htf_trend, mode, bullish=True):
 # ---------------------------------------------------------------------------
 # Feature engineering on the trading timeframe
 # ---------------------------------------------------------------------------
-def compute_intraday_features(df, donchian_len=20, vol_ma_len=20):
+def compute_intraday_features(df, donchian_len=20, vol_ma_len=20, mom_len=10):
     """Compute breakout-relevant features from an intraday OHLCV frame"""
     try:
         if df is None or len(df) < 40:
@@ -1833,6 +1833,23 @@ def compute_intraday_features(df, donchian_len=20, vol_ma_len=20):
         rsi = calculate_rsi(close, 14)
         atr = calculate_atr_series(high, low, close, 14)
         vol_ma = volume.rolling(vol_ma_len).mean()
+
+        # ---- Gamma Blast proxy inputs (ported from the Pine v5 indicator) ----
+        # Volatility regime expansion: is the current ATR large relative to its
+        # own recent average? This is the genuinely new information the blast
+        # indicator carries — nothing else in the five-factor model measures it.
+        atr_ma = atr.rolling(20).mean()
+        vol_expansion_s = atr / atr_ma.replace(0, np.nan)
+
+        # Rate of change over `mom_len` bars — thrust, as distinct from level break
+        mom_s = (close - close.shift(mom_len)) / close.shift(mom_len).replace(0, np.nan) * 100
+
+        # Pine formula, reproduced exactly so the number matches TradingView:
+        #   (volume_ratio - 1)*25 + abs(momentum)*2 + (vol_expansion - 1)*50
+        vol_ratio_s = volume / vol_ma.replace(0, np.nan)
+        gamma_s = ((vol_ratio_s - 1) * 25
+                   + mom_s.abs() * 2
+                   + (vol_expansion_s - 1) * 50)
 
         # Bollinger width -> base compression measure
         ma20 = close.rolling(20).mean()
@@ -1861,6 +1878,21 @@ def compute_intraday_features(df, donchian_len=20, vol_ma_len=20):
         last_atr = float(atr.iloc[i]) if not pd.isna(atr.iloc[i]) else 0.0
         last_vwap = float(vwap.iloc[i]) if not pd.isna(vwap.iloc[i]) else None
         bar_range = max(last_high - last_low, 1e-9)
+
+        # ---- Gamma blast scalars ----
+        vol_expansion = float(vol_expansion_s.iloc[i]) if not pd.isna(vol_expansion_s.iloc[i]) else 1.0
+        price_momentum = float(mom_s.iloc[i]) if not pd.isna(mom_s.iloc[i]) else 0.0
+        gamma_score = float(gamma_s.iloc[i]) if not pd.isna(gamma_s.iloc[i]) else 0.0
+
+        # How unusual is this blast FOR THIS STOCK? A raw score of 60 means
+        # something different on a quiet counter than on a permanently wild one.
+        gamma_rank = 0.5
+        try:
+            g_hist = gamma_s.dropna().iloc[-120:]
+            if len(g_hist) >= 30:
+                gamma_rank = _pct_rank(g_hist, gamma_score)
+        except Exception:
+            pass
 
         level_up = float(don_high.iloc[i]) if not pd.isna(don_high.iloc[i]) else None
         level_dn = float(don_low.iloc[i]) if not pd.isna(don_low.iloc[i]) else None
@@ -1907,6 +1939,10 @@ def compute_intraday_features(df, donchian_len=20, vol_ma_len=20):
             'atr': last_atr,
             'atr_pct': (last_atr / last_close * 100) if last_close else 0.0,
             'bar_range': bar_range,
+            'vol_expansion': vol_expansion,
+            'price_momentum': price_momentum,
+            'gamma_score': gamma_score,
+            'gamma_rank': gamma_rank,
             'don_high': level_up,
             'don_low': level_dn,
             'don_high_prev': float(don_high.iloc[i - 1]) if not pd.isna(don_high.iloc[i - 1]) else None,
@@ -1956,11 +1992,51 @@ BREAKOUT_FACTORS = {
         'desc': 'Price versus session VWAP and the EMA 20/50 stack on the trading '
                 'timeframe.'
     },
+    # Optional sixth factor - off by default. See BLAST_FACTOR_KEY below.
+    'blast_thrust': {
+        'weight': 15,
+        'label': 'Thrust Expansion',
+        'desc': 'Gamma-blast proxy. Volatility regime expansion (ATR vs its own '
+                '20-bar average) plus rate-of-change thrust. Measures whether the '
+                'move is ACCELERATING, which a level break alone does not tell you.'
+    },
 }
+
+BLAST_FACTOR_KEY = 'blast_thrust'
+
+# Factors used unless the blast factor is switched on
+CORE_FACTOR_KEYS = [k for k in BREAKOUT_FACTORS if k != BLAST_FACTOR_KEY]
+
+
+def detect_gamma_blast(feat, bullish, sensitivity=1.5, vol_mult=2.0,
+                       rsi_bull=70.0, rsi_bear=30.0, score_floor=50.0):
+    """
+    Boolean blast flag, reproducing the Pine v5 gamma_blast condition:
+
+        high_volume       : volume_ratio > vol_mult
+        extreme RSI       : rsi > 70 (bull) / rsi < 30 (bear)
+        strong momentum   : |ROC| > sensitivity, in the trade direction
+        vol expansion     : ATR / SMA(ATR,20) > 1.2
+
+    The Pine 'spike' additionally requires gamma_score > 50.
+    """
+    if not feat:
+        return False, False
+    mom = feat.get('price_momentum', 0.0)
+    directional_mom = mom if bullish else -mom
+    cond = (
+        feat.get('rel_volume', 0) > vol_mult
+        and (feat.get('rsi', 50) > rsi_bull if bullish else feat.get('rsi', 50) < rsi_bear)
+        and directional_mom > sensitivity
+        and feat.get('vol_expansion', 1.0) > 1.2
+    )
+    spike = bool(cond and feat.get('gamma_score', 0.0) > score_floor)
+    return bool(cond), spike
 
 
 def score_breakout(feat, direction="Bullish Breakout", rel_vol_threshold=1.5,
-                   donchian_len=20, veto_exhaustion=True):
+                   donchian_len=20, veto_exhaustion=True,
+                   use_blast_factor=False, blast_sensitivity=1.5, blast_vol_mult=2.0):
     """
     Score a breakout on five graded factors.
 
@@ -2030,7 +2106,27 @@ def score_breakout(feat, direction="Bullish Breakout", rel_vol_threshold=1.5,
                                  + 0.35 * (1.0 if ema_ok else 0.0)
                                  + 0.25 * _clip01((close_str - 0.4) / 0.4))
 
-    composite = sum(BREAKOUT_FACTORS[k]['weight'] * v for k, v in factors.items())
+    # ---- 6. Thrust expansion / gamma blast (15, OPTIONAL) ------------------
+    # Deliberately excludes the volume term of the Pine formula: relative volume
+    # is already factor 2, and double-counting it would inflate scores for the
+    # same evidence. Only the two non-redundant components are used here.
+    if use_blast_factor:
+        expansion_score = _clip01((feat.get('vol_expansion', 1.0) - 1.0) / 0.5)
+        mom = feat.get('price_momentum', 0.0)
+        directional_mom = mom if bullish else -mom
+        thrust_score = _clip01(directional_mom / (2.0 * max(blast_sensitivity, 0.1)))
+        factors[BLAST_FACTOR_KEY] = 0.5 * expansion_score + 0.5 * thrust_score
+
+    # Normalise over the weights actually in play, so the composite stays on a
+    # 0-100 scale whether or not the sixth factor is enabled. With the blast
+    # factor off the arithmetic is identical to before.
+    active_weight = sum(BREAKOUT_FACTORS[k]['weight'] for k in factors)
+    composite = (sum(BREAKOUT_FACTORS[k]['weight'] * v for k, v in factors.items())
+                 / active_weight * 100) if active_weight else 0.0
+
+    blast_on, blast_spike = detect_gamma_blast(
+        feat, bullish, sensitivity=blast_sensitivity, vol_mult=blast_vol_mult
+    )
 
     # Freshness: did the break happen on this candle, or is it already extended?
     prev_level = feat.get('don_high_prev') if bullish else feat.get('don_low_prev')
@@ -2045,6 +2141,8 @@ def score_breakout(feat, direction="Bullish Breakout", rel_vol_threshold=1.5,
         'breakout_level': level,
         'margin_atr': margin,
         'extension_atr': extension,
+        'blast': blast_on,
+        'blast_spike': blast_spike,
     }
 
 
@@ -2136,7 +2234,9 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
                           rel_vol_threshold=1.5, min_price=10.0, min_avg_volume=25000,
                           donchian_len=20, min_score=55, max_results=40, chunk_size=25,
                           trend_mode="Strict (HTF + Daily)", veto_exhaustion=True,
-                          final_rank="Breakout Score", include_valuation=True):
+                          final_rank="Breakout Score", include_valuation=True,
+                          use_blast_factor=False, blast_sensitivity=1.5,
+                          blast_vol_mult=2.0, blast_only=False):
     """
     Purely technical three-stage funnel:
 
@@ -2152,7 +2252,7 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
     tickers = list(universe.keys())
     total = len(tickers)
     funnel = {'scanned': 0, 'broke_out': 0, 'trend_aligned': 0,
-              'final': 0, 'no_daily_data': 0}
+              'final': 0, 'no_daily_data': 0, 'blast': 0}
 
     if total == 0:
         return pd.DataFrame(), funnel
@@ -2188,7 +2288,10 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
                 continue
 
             verdict = score_breakout(feat, direction, rel_vol_threshold,
-                                     donchian_len, veto_exhaustion)
+                                     donchian_len, veto_exhaustion,
+                                     use_blast_factor=use_blast_factor,
+                                     blast_sensitivity=blast_sensitivity,
+                                     blast_vol_mult=blast_vol_mult)
             if not verdict:
                 continue
 
@@ -2260,6 +2363,12 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
             'VWAP Dist %': vwap_dist,
             'RSI': feat['rsi'],
             'ATR %': feat['atr_pct'],
+            'Gamma Score': feat['gamma_score'],
+            'Blast Rank': feat['gamma_rank'] * 100,
+            'Vol Expansion': feat['vol_expansion'],
+            'Momentum %': feat['price_momentum'],
+            'Blast': bool(v.get('blast')),
+            'Blast Spike': bool(v.get('blast_spike')),
             'Base Bars': feat['base_len'],
             'Level Touches': feat['touches'],
             'Breakout Quality': v['factors']['range_break'],
@@ -2267,6 +2376,7 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
             'Base Compression': v['factors']['base_compression'],
             'Entry Efficiency': v['factors']['entry_efficiency'],
             'Intraday Momentum': v['factors']['momentum_align'],
+            'Thrust Expansion': v['factors'].get(BLAST_FACTOR_KEY),
             'Last Candle': feat['last_bar_time'].strftime('%d-%b %H:%M')
                            if hasattr(feat['last_bar_time'], 'strftime') else str(feat['last_bar_time']),
             'Valuation': build_valuation_link(c['ticker']),
@@ -2280,6 +2390,15 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
     if df_out.empty:
         return df_out, funnel
 
+    if 'Blast' in df_out.columns:
+        funnel['blast'] = int(df_out['Blast'].sum())
+
+    # Optional hard gate: only setups that also fire the Pine blast condition
+    if blast_only and 'Blast' in df_out.columns:
+        df_out = df_out[df_out['Blast']]
+        if df_out.empty:
+            return df_out, funnel
+
     df_out = df_out[df_out['Score'] >= min_score]
     if df_out.empty:
         return df_out, funnel
@@ -2287,6 +2406,8 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
     # ---------------- Final ranking ----------------
     if final_rank == "Upside %" and 'Upside %' in df_out.columns:
         df_out = df_out.sort_values('Upside %', ascending=False, na_position='last')
+    elif final_rank == "Gamma Score" and 'Gamma Score' in df_out.columns:
+        df_out = df_out.sort_values('Gamma Score', ascending=False, na_position='last')
     else:
         df_out = df_out.sort_values(['Score', 'Rel Vol'], ascending=[False, False])
 
@@ -2950,6 +3071,29 @@ def main():
             help="Rejects breakouts already 3+ ATR beyond VWAP with an extreme RSI — "
                  "the point where breakout buyers become exit liquidity."
         )
+        st.sidebar.markdown("### ⚡ Gamma Blast Proxy")
+        use_blast_factor = st.sidebar.checkbox(
+            "Add Thrust Expansion as 6th factor", value=False,
+            help="Adds volatility expansion + rate-of-change thrust to the composite "
+                 "score (weight 15, renormalised to 0-100). Off by default so scores "
+                 "stay comparable with earlier scans."
+        )
+        blast_only = st.sidebar.checkbox(
+            "Only show Gamma Blast setups", value=False,
+            help="Hard gate: keeps only breakouts that ALSO satisfy the full Pine "
+                 "blast condition. Expect very few hits — this is a rare signal."
+        )
+        blast_sensitivity = st.sidebar.slider(
+            "Blast Sensitivity (ROC %)", 0.2, 3.0, 1.5, 0.1,
+            help="Minimum 10-bar rate of change, in the trade direction. "
+                 "Matches the 'sensitivity' input in your Pine indicator."
+        )
+        blast_vol_mult = st.sidebar.slider(
+            "Blast Volume Multiplier", 1.0, 5.0, 2.0, 0.25,
+            help="Volume ratio required for the blast flag. Matches "
+                 "'volume_threshold' in the Pine indicator."
+        )
+        
         min_price = st.sidebar.number_input("Min Price (₹)", min_value=1.0, value=20.0, step=5.0)
         min_avg_volume = st.sidebar.number_input("Min Avg Bar Volume", min_value=0, value=25000, step=5000)
         max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="bo_max_results")
@@ -2968,7 +3112,7 @@ def main():
         
         final_rank = st.sidebar.selectbox(
             "Rank results by",
-            ["Breakout Score", "Upside %"],
+            ["Breakout Score", "Gamma Score", "Upside %"],
             help="Ranking by Upside %% only re-orders the same technical results — "
                  "it never removes a setup."
         )
@@ -3034,7 +3178,11 @@ is display-only — it labels what came through, it never removes anything.
                         trend_mode=trend_mode,
                         veto_exhaustion=veto_exhaustion,
                         final_rank=final_rank,
-                        include_valuation=include_valuation
+                        include_valuation=include_valuation,
+                        use_blast_factor=use_blast_factor,
+                        blast_sensitivity=blast_sensitivity,
+                        blast_vol_mult=blast_vol_mult,
+                        blast_only=blast_only
                     )
                 
                 st.session_state['breakout_results'] = bo_df
@@ -3113,10 +3261,27 @@ is display-only — it labels what came through, it never removes anything.
                         bo_display[col] = bo_display[col].apply(
                             lambda x: f"{x:+.2f}%" if pd.notna(x) else 'N/A')
                 
-                for col in ['Margin (ATR)', 'Extension (ATR)']:
+                for col in ['Margin (ATR)', 'Extension (ATR)', 'Vol Expansion']:
                     if col in bo_display.columns:
                         bo_display[col] = bo_display[col].apply(
                             lambda x: f"{x:.2f}" if pd.notna(x) else 'N/A')
+                
+                if 'Gamma Score' in bo_display.columns:
+                    bo_display['Gamma Score'] = bo_display['Gamma Score'].apply(
+                        lambda x: f"{x:.1f}" if pd.notna(x) else 'N/A')
+                if 'Blast Rank' in bo_display.columns:
+                    bo_display['Blast Rank'] = bo_display['Blast Rank'].apply(
+                        lambda x: f"{x:.0f}%ile" if pd.notna(x) else 'N/A')
+                if 'Momentum %' in bo_display.columns:
+                    bo_display['Momentum %'] = bo_display['Momentum %'].apply(
+                        lambda x: f"{x:+.2f}%" if pd.notna(x) else 'N/A')
+                if 'Blast' in bo_display.columns:
+                    _spike = bo_display['Blast Spike'] if 'Blast Spike' in bo_display.columns else None
+                    bo_display['Blast'] = [
+                        ("💥 Spike" if (_spike is not None and bool(_spike.iloc[k]))
+                         else ("⚡ Blast" if bool(b) else "—"))
+                        for k, b in enumerate(bo_display['Blast'])
+                    ]
                 
                 if 'ATR %' in bo_display.columns:
                     bo_display['ATR %'] = bo_display['ATR %'].apply(
@@ -3136,9 +3301,11 @@ is display-only — it labels what came through, it never removes anything.
                         lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
                 
                 bo_columns = ['Ticker', 'Name', 'Timeframe', 'LTP', 'Fair Value', 'Upside %',
-                              'Value Tag', 'Score', 'Setup', 'Daily Trend', _htf_col,
+                              'Value Tag', 'Score', 'Setup', 'Blast', 'Gamma Score',
+                              'Blast Rank', 'Daily Trend', _htf_col,
                               'Breakout Level', 'Margin (ATR)', 'Volume', 'Rel Vol',
                               'Session Volume', 'VWAP', 'VWAP Dist %', 'RSI', 'ATR %',
+                              'Vol Expansion', 'Momentum %',
                               'PE Ratio', 'Cap Type', 'Last Candle', 'Valuation']
                 bo_columns = [c for c in bo_columns if c in bo_display.columns]
                 
@@ -3157,7 +3324,7 @@ is display-only — it labels what came through, it never removes anything.
                                "very different trades — one strong on volume, another on base quality.")
                     factor_cols = ['Ticker', 'Score', 'Breakout Quality', 'Volume Confirmation',
                                    'Base Compression', 'Entry Efficiency', 'Intraday Momentum',
-                                   'Base Bars', 'Level Touches']
+                                   'Thrust Expansion', 'Base Bars', 'Level Touches']
                     factor_cols = [c for c in factor_cols if c in bo_df.columns]
                     st.dataframe(bo_df[factor_cols], use_container_width=True, hide_index=True)
                 
