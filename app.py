@@ -1447,34 +1447,30 @@ def search_stocks_by_name(query, max_results=50):
 # ever allowed to remove a valid technical setup from the results.
 # ============================================================================
 
-# Timeframe configuration for intraday screening
-INTRADAY_TIMEFRAMES = {
+# Timeframe configuration
+SCREENER_TIMEFRAMES = {
     "15 Minute": {
         "interval": "15m",
         "period": "30d",
-        "bars_per_day": 25,
-        "htf_rule": "1h",       # Confirmation timeframe (resampled from 15m)
-        "htf_label": "1H",
-        "min_bars": 60,
-        "label": "15m"
+        "label": "15m",
+        "session_vwap": True,
+        "note": "Intraday. Yahoo caps 15m history at 60 days."
     },
     "1 Hour": {
         "interval": "1h",
         "period": "90d",
-        "bars_per_day": 7,
-        "htf_rule": "4h",       # Confirmation timeframe (resampled from 1h)
-        "htf_label": "4H",
-        "min_bars": 60,
-        "label": "1H"
-    }
-}
-
-# Multi-timeframe alignment strictness
-TREND_MODES = {
-    "Strict (HTF + Daily)": "strict",
-    "Daily Trend Only": "daily",
-    "Intraday HTF Only": "htf",
-    "Off (Pure Breakout)": "off",
+        "label": "1H",
+        "session_vwap": True,
+        "note": "Intraday. Roughly 7 candles per session."
+    },
+    "1 Day": {
+        "interval": "1d",
+        "period": "2y",
+        "label": "1D",
+        "session_vwap": False,
+        "note": "Positional. VWAP becomes a rolling 20-day VWAP, since a daily "
+                "candle has no intraday session to anchor to."
+    },
 }
 
 
@@ -1567,16 +1563,6 @@ def calculate_session_vwap(df):
         return pd.Series(index=df.index, dtype=float)
 
 
-def _clip01(x):
-    """Clamp to the 0..1 range, treating NaN as 0"""
-    try:
-        if x is None or pd.isna(x):
-            return 0.0
-        return float(max(0.0, min(1.0, x)))
-    except Exception:
-        return 0.0
-
-
 def _pct_rank(series, value):
     """Fraction of observations below `value` (0..1). Avoids a scipy dependency."""
     try:
@@ -1612,12 +1598,6 @@ def format_volume(v):
 def fetch_intraday_batch(tickers_tuple, interval, period):
     """Batch download intraday OHLCV for many tickers at once. Cached 5 minutes."""
     return _batch_download(tickers_tuple, interval, period)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_daily_batch(tickers_tuple, period="1y"):
-    """Batch download daily OHLCV for the higher-timeframe trend filter. Cached 1 hour."""
-    return _batch_download(tickers_tuple, "1d", period)
 
 
 def _batch_download(tickers_tuple, interval, period):
@@ -1663,486 +1643,194 @@ def _batch_download(tickers_tuple, interval, period):
 
 
 # ---------------------------------------------------------------------------
-# MULTI-TIMEFRAME TREND CONTEXT
+# GAMMA BLAST ENGINE
 # ---------------------------------------------------------------------------
-def compute_daily_trend(daily_df):
-    """
-    Primary trend from daily candles.
+# A direct port of the "Nyztrade Gamma Flow" Pine v5 indicator. Every number
+# produced here reproduces the TradingView formula exactly:
+#
+#     volume_ratio         = volume / SMA(volume, vol_ma_len)
+#     price_momentum       = (close - close[mom_len]) / close[mom_len] * 100
+#     volatility_expansion = ATR(14) / SMA(ATR(14), 20)
+#
+#     gamma_score = (volume_ratio - 1) * 25
+#                 + abs(price_momentum) * 2
+#                 + (volatility_expansion - 1) * 50
+#
+#     blast (bull) = volume_ratio > vol_mult
+#                    AND rsi > rsi_bull
+#                    AND price_momentum > sensitivity
+#                    AND volatility_expansion > 1.2
+#
+#     spike        = blast AND gamma_score > score_floor
+# ---------------------------------------------------------------------------
 
-    Returns a label plus a 0..1 strength score. This is the top of the
-    timeframe stack - a 15m breakout inside a daily downtrend is usually a
-    short-covering pop, not a trend continuation.
+def compute_blast_features(df, cfg, rsi_len=14, vol_ma_len=20, mom_len=10,
+                           sensitivity=1.5, vol_mult=2.0, rsi_bull=70.0,
+                           rsi_bear=30.0, score_floor=50.0, bullish=True):
+    """
+    Compute every Gamma Blast input for one symbol on one timeframe.
+
+    Returns None when there is not enough history to form the 20-bar ATR
+    average that volatility_expansion depends on.
     """
     try:
-        if daily_df is None or len(daily_df) < 60:
-            return {'label': 'Unknown', 'score': 0.5, 'aligned_up': False,
-                    'aligned_down': False, 'ema50': None, 'roc20': None}
-
-        close = daily_df['Close'].dropna()
-        if len(close) < 60 or float(close.iloc[-1]) <= 0:
-            return {'label': 'Unknown', 'score': 0.5, 'aligned_up': False,
-                    'aligned_down': False, 'ema50': None, 'roc20': None}
-
-        ema20 = close.ewm(span=20, adjust=False).mean()
-        ema50 = close.ewm(span=50, adjust=False).mean()
-        ema200 = close.ewm(span=200, adjust=False).mean() if len(close) >= 200 else ema50
-
-        c = float(close.iloc[-1])
-        e20, e50, e200 = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(ema200.iloc[-1])
-        roc20 = float((c / close.iloc[-21] - 1) * 100) if len(close) > 21 else 0.0
-
-        # Separations are measured in ATR units, not raw percentages.
-        # A fixed "1% above the EMA" means a strong trend in a placid large-cap
-        # and pure noise in a high-beta midcap. Normalising by the stock's own
-        # daily ATR makes one threshold valid across the whole universe, and
-        # stops a choppy sideways chart from voting itself into a trend.
-        try:
-            atr_d = float(calculate_atr_series(daily_df['High'], daily_df['Low'],
-                                               close, 14).iloc[-1])
-        except Exception:
-            atr_d = 0.0
-        if not atr_d or atr_d <= 0 or pd.isna(atr_d):
-            atr_d = float(close.pct_change().std() * c) or (c * 0.02)
-
-        d_c_e20 = (c - e20) / atr_d
-        d_c_e50 = (c - e50) / atr_d
-        d_e20_e50 = (e20 - e50) / atr_d
-        d_e50_e200 = (e50 - e200) / atr_d
-        roc_atr = (c - float(close.iloc[-21])) / atr_d if len(close) > 21 else 0.0
-
-        up_votes = sum([d_c_e20 > 0.5, d_c_e50 > 1.5, d_e20_e50 > 0.75,
-                        d_e50_e200 > 1.0, roc_atr > 2.0])
-        down_votes = sum([d_c_e20 < -0.5, d_c_e50 < -1.5, d_e20_e50 < -0.75,
-                          d_e50_e200 < -1.0, roc_atr < -2.0])
-
-        if up_votes >= 4:
-            label = "🟢 Strong Uptrend"
-        elif up_votes >= 3:
-            label = "🟩 Uptrend"
-        elif down_votes >= 4:
-            label = "🔴 Strong Downtrend"
-        elif down_votes >= 3:
-            label = "🟥 Downtrend"
-        else:
-            label = "⬜ Sideways"
-
-        return {
-            'label': label,
-            'score': up_votes / 5.0,
-            # The GATE is stricter than the LABEL: 4 of 5 votes to actually let a
-            # trade through, 3 is enough to be described as an uptrend on screen.
-            'aligned_up': up_votes >= 4,
-            'aligned_down': down_votes >= 4,
-            'ema50': e50,
-            'roc20': roc20,
-        }
-    except Exception:
-        return {'label': 'Unknown', 'score': 0.5, 'aligned_up': False,
-                'aligned_down': False, 'ema50': None, 'roc20': None}
-
-
-def compute_htf_trend(intraday_df, htf_rule):
-    """
-    Intermediate confirmation trend, resampled from the trading timeframe.
-
-    15m trading -> 1H confirmation;  1H trading -> 4H confirmation.
-    Resampling avoids a second network round-trip per stock.
-    """
-    try:
-        if intraday_df is None or len(intraday_df) < 40:
-            return {'label': 'Unknown', 'score': 0.5, 'aligned_up': False, 'aligned_down': False}
-
-        agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
-        htf = intraday_df.resample(htf_rule).agg(agg).dropna(subset=['Close'])
-        if len(htf) < 25:
-            return {'label': 'Unknown', 'score': 0.5, 'aligned_up': False, 'aligned_down': False}
-
-        close = htf['Close']
-        ema20 = close.ewm(span=20, adjust=False).mean()
-        ema50 = close.ewm(span=50, adjust=False).mean() if len(close) >= 50 else ema20
-
-        c = float(close.iloc[-1])
-        e20, e50 = float(ema20.iloc[-1]), float(ema50.iloc[-1])
-        slope = float(ema20.iloc[-1] - ema20.iloc[-5]) if len(ema20) > 5 else 0.0
-
-        # Normalised to price so the thresholds mean the same thing at ₹85 and ₹1,700
-        d_c_e20 = (c - e20) / c * 100
-        d_e20_e50 = (e20 - e50) / c * 100
-        slope_pct = slope / c * 100
-
-        up_votes = sum([d_c_e20 > 0.15, d_e20_e50 > 0.15, slope_pct > 0.10])
-        down_votes = sum([d_c_e20 < -0.15, d_e20_e50 < -0.15, slope_pct < -0.10])
-
-        if up_votes == 3:
-            label = "🟢 Up"
-        elif up_votes == 2:
-            label = "🟩 Mild Up"
-        elif down_votes == 3:
-            label = "🔴 Down"
-        elif down_votes == 2:
-            label = "🟥 Mild Down"
-        else:
-            label = "⬜ Flat"
-
-        return {
-            'label': label,
-            'score': up_votes / 3.0,
-            'aligned_up': up_votes >= 2,
-            'aligned_down': down_votes >= 2,
-        }
-    except Exception:
-        return {'label': 'Unknown', 'score': 0.5, 'aligned_up': False, 'aligned_down': False}
-
-
-def trend_gate_passes(daily_trend, htf_trend, mode, bullish=True):
-    """Apply the selected multi-timeframe alignment strictness"""
-    key = TREND_MODES.get(mode, "strict")
-    if key == "off":
-        return True
-    d_ok = daily_trend['aligned_up'] if bullish else daily_trend['aligned_down']
-    h_ok = htf_trend['aligned_up'] if bullish else htf_trend['aligned_down']
-    if key == "strict":
-        return bool(d_ok and h_ok)
-    if key == "daily":
-        return bool(d_ok)
-    if key == "htf":
-        return bool(h_ok)
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Feature engineering on the trading timeframe
-# ---------------------------------------------------------------------------
-def compute_intraday_features(df, donchian_len=20, vol_ma_len=20, mom_len=10):
-    """Compute breakout-relevant features from an intraday OHLCV frame"""
-    try:
-        if df is None or len(df) < 40:
+        if df is None or len(df) < 45:
             return None
 
         d = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         d = d.dropna(subset=['Close', 'High', 'Low'])
-        if len(d) < 40:
+        if len(d) < 45:
             return None
 
         close, high, low = d['Close'], d['High'], d['Low']
         volume = d['Volume'].fillna(0)
 
-        vwap = calculate_session_vwap(d)
-        ema20 = close.ewm(span=20, adjust=False).mean()
-        ema50 = close.ewm(span=50, adjust=False).mean()
-        rsi = calculate_rsi(close, 14)
-        atr = calculate_atr_series(high, low, close, 14)
+        # ---- Pine inputs ----
+        rsi = calculate_rsi(close, rsi_len)
         vol_ma = volume.rolling(vol_ma_len).mean()
-
-        # ---- Gamma Blast proxy inputs (ported from the Pine v5 indicator) ----
-        # Volatility regime expansion: is the current ATR large relative to its
-        # own recent average? This is the genuinely new information the blast
-        # indicator carries — nothing else in the five-factor model measures it.
-        atr_ma = atr.rolling(20).mean()
-        vol_expansion_s = atr / atr_ma.replace(0, np.nan)
-
-        # Rate of change over `mom_len` bars — thrust, as distinct from level break
+        vol_ratio_s = volume / vol_ma.replace(0, np.nan)
         mom_s = (close - close.shift(mom_len)) / close.shift(mom_len).replace(0, np.nan) * 100
 
-        # Pine formula, reproduced exactly so the number matches TradingView:
-        #   (volume_ratio - 1)*25 + abs(momentum)*2 + (vol_expansion - 1)*50
-        vol_ratio_s = volume / vol_ma.replace(0, np.nan)
+        atr = calculate_atr_series(high, low, close, 14)
+        atr_ma = atr.rolling(20).mean()
+        vol_exp_s = atr / atr_ma.replace(0, np.nan)
+
         gamma_s = ((vol_ratio_s - 1) * 25
                    + mom_s.abs() * 2
-                   + (vol_expansion_s - 1) * 50)
+                   + (vol_exp_s - 1) * 50)
 
-        # Bollinger width -> base compression measure
-        ma20 = close.rolling(20).mean()
-        sd20 = close.rolling(20).std()
-        bbw = ((ma20 + 2 * sd20) - (ma20 - 2 * sd20)) / ma20.replace(0, np.nan) * 100
+        # ---- Blast condition, evaluated across the whole series ----
+        if bullish:
+            cond_s = ((vol_ratio_s > vol_mult) & (rsi > rsi_bull)
+                      & (mom_s > sensitivity) & (vol_exp_s > 1.2))
+        else:
+            cond_s = ((vol_ratio_s > vol_mult) & (rsi < rsi_bear)
+                      & (mom_s < -sensitivity) & (vol_exp_s > 1.2))
+        cond_s = cond_s.fillna(False)
+        spike_s = cond_s & (gamma_s > score_floor)
 
-        # Donchian channel of the PRIOR n bars
-        don_high = high.rolling(donchian_len).max().shift(1)
-        don_low = low.rolling(donchian_len).min().shift(1)
-
-        session_key = pd.Series(pd.to_datetime(d.index).date, index=d.index)
-        sessions = list(dict.fromkeys(session_key.tolist()))
-        cur = d[session_key == sessions[-1]]
-
-        prev_day_close = None
-        if len(sessions) >= 2:
-            prev = d[session_key == sessions[-2]]
-            if not prev.empty:
-                prev_day_close = float(prev['Close'].iloc[-1])
+        # ---- VWAP: session-anchored intraday, rolling on the daily chart ----
+        if cfg.get('session_vwap', True):
+            vwap_s = calculate_session_vwap(d)
+        else:
+            typical = (high + low + close) / 3.0
+            pv = (typical * volume).rolling(20).sum()
+            vv = volume.rolling(20).sum().replace(0, np.nan)
+            vwap_s = pv / vv
 
         i = -1
         last_close = float(close.iloc[i])
-        last_high, last_low = float(high.iloc[i]), float(low.iloc[i])
         last_vol = float(volume.iloc[i]) if not pd.isna(volume.iloc[i]) else 0.0
         avg_vol = float(vol_ma.iloc[i]) if not pd.isna(vol_ma.iloc[i]) else 0.0
         last_atr = float(atr.iloc[i]) if not pd.isna(atr.iloc[i]) else 0.0
-        last_vwap = float(vwap.iloc[i]) if not pd.isna(vwap.iloc[i]) else None
-        bar_range = max(last_high - last_low, 1e-9)
+        last_vwap = float(vwap_s.iloc[i]) if not pd.isna(vwap_s.iloc[i]) else None
 
-        # ---- Gamma blast scalars ----
-        vol_expansion = float(vol_expansion_s.iloc[i]) if not pd.isna(vol_expansion_s.iloc[i]) else 1.0
-        price_momentum = float(mom_s.iloc[i]) if not pd.isna(mom_s.iloc[i]) else 0.0
+        vol_ratio = float(vol_ratio_s.iloc[i]) if not pd.isna(vol_ratio_s.iloc[i]) else 0.0
+        momentum = float(mom_s.iloc[i]) if not pd.isna(mom_s.iloc[i]) else 0.0
+        vol_expansion = float(vol_exp_s.iloc[i]) if not pd.isna(vol_exp_s.iloc[i]) else 1.0
         gamma_score = float(gamma_s.iloc[i]) if not pd.isna(gamma_s.iloc[i]) else 0.0
 
-        # How unusual is this blast FOR THIS STOCK? A raw score of 60 means
-        # something different on a quiet counter than on a permanently wild one.
+        blast_now = bool(cond_s.iloc[i])
+        blast_prev = bool(cond_s.iloc[i - 1]) if len(cond_s) > 1 else False
+        spike_now = bool(spike_s.iloc[i])
+
+        # How many consecutive bars has the blast been firing?
+        streak = 0
+        for k in range(1, min(len(cond_s), 40) + 1):
+            if bool(cond_s.iloc[-k]):
+                streak += 1
+            else:
+                break
+
+        # How often does this stock blast? A name that fires constantly is
+        # noisy, not exceptional — this is the context the raw score lacks.
+        blast_freq = int(cond_s.iloc[-100:].sum()) if len(cond_s) >= 100 else int(cond_s.sum())
+
+        # Percentile of the current score against this stock's own history
         gamma_rank = 0.5
         try:
-            g_hist = gamma_s.dropna().iloc[-120:]
+            g_hist = gamma_s.dropna().iloc[-150:]
             if len(g_hist) >= 30:
                 gamma_rank = _pct_rank(g_hist, gamma_score)
         except Exception:
             pass
 
-        level_up = float(don_high.iloc[i]) if not pd.isna(don_high.iloc[i]) else None
-        level_dn = float(don_low.iloc[i]) if not pd.isna(don_low.iloc[i]) else None
-
-        # ---- Base quality: how long price coiled, and how often the level was tested
-        base_len, touches = 0, 0
-        try:
-            if level_up and last_atr > 0:
-                tol = 0.30 * last_atr
-                window = high.iloc[-(donchian_len * 3):-1]
-                touches = int(((window >= level_up - tol) & (window <= level_up + tol)).sum())
-                # Count consecutive prior bars that stayed below the level
-                for k in range(2, min(len(close), donchian_len * 4)):
-                    if float(high.iloc[-k]) <= level_up + tol:
-                        base_len += 1
-                    else:
-                        break
-        except Exception:
-            pass
-
-        # ---- Compression: percentile rank of BB width just BEFORE the break
-        compression = 0.5
-        try:
-            bbw_hist = bbw.dropna().iloc[-120:]
-            if len(bbw_hist) >= 30 and len(bbw_hist) > 2:
-                pre = float(bbw_hist.iloc[-2])
-                compression = 1.0 - _pct_rank(bbw_hist, pre)   # tighter base -> higher
-        except Exception:
-            pass
+        # ---- Session / prior-bar context ----
+        if cfg.get('session_vwap', True):
+            session_key = pd.Series(pd.to_datetime(d.index).date, index=d.index)
+            sessions = list(dict.fromkeys(session_key.tolist()))
+            cur = d[session_key == sessions[-1]]
+            session_volume = float(cur['Volume'].fillna(0).sum()) if not cur.empty else last_vol
+            ref_close = None
+            if len(sessions) >= 2:
+                prev = d[session_key == sessions[-2]]
+                if not prev.empty:
+                    ref_close = float(prev['Close'].iloc[-1])
+        else:
+            session_volume = last_vol
+            ref_close = float(close.iloc[i - 1])
 
         return {
             'price': last_close,
-            'high': last_high,
-            'low': last_low,
-            'prev_bar_close': float(close.iloc[i - 1]),
             'last_volume': last_vol,
             'avg_volume': avg_vol,
-            'rel_volume': (last_vol / avg_vol) if avg_vol > 0 else 0.0,
-            'session_volume': float(cur['Volume'].fillna(0).sum()) if not cur.empty else 0.0,
-            'vwap': last_vwap,
-            'ema20': float(ema20.iloc[i]),
-            'ema50': float(ema50.iloc[i]),
+            'session_volume': session_volume,
+            'vol_ratio': vol_ratio,
             'rsi': float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else 50.0,
-            'atr': last_atr,
-            'atr_pct': (last_atr / last_close * 100) if last_close else 0.0,
-            'bar_range': bar_range,
+            'momentum': momentum,
             'vol_expansion': vol_expansion,
-            'price_momentum': price_momentum,
             'gamma_score': gamma_score,
             'gamma_rank': gamma_rank,
-            'don_high': level_up,
-            'don_low': level_dn,
-            'don_high_prev': float(don_high.iloc[i - 1]) if not pd.isna(don_high.iloc[i - 1]) else None,
-            'don_low_prev': float(don_low.iloc[i - 1]) if not pd.isna(don_low.iloc[i - 1]) else None,
-            'base_len': base_len,
-            'touches': touches,
-            'compression': compression,
-            'closing_strength': (last_close - last_low) / bar_range,
-            'day_change_pct': ((last_close - prev_day_close) / prev_day_close * 100) if prev_day_close else 0.0,
+            'blast': blast_now,
+            'blast_prev': blast_prev,
+            'spike': spike_now,
+            'streak': streak,
+            'blast_freq': blast_freq,
+            'atr': last_atr,
+            'atr_pct': (last_atr / last_close * 100) if last_close else 0.0,
+            'vwap': last_vwap,
+            'day_change_pct': ((last_close - ref_close) / ref_close * 100) if ref_close else 0.0,
             'last_bar_time': d.index[i],
         }
     except Exception:
         return None
 
 
-# ---------------------------------------------------------------------------
-# THE FIVE-FACTOR BREAKOUT MODEL
-# ---------------------------------------------------------------------------
-BREAKOUT_FACTORS = {
-    'range_break': {
-        'weight': 30,
-        'label': 'Breakout Quality',
-        'desc': 'Clears the level decisively (in ATR units), out of a long, '
-                'well-tested base rather than a 3-bar wiggle.'
-    },
-    'volume_thrust': {
-        'weight': 25,
-        'label': 'Volume Confirmation',
-        'desc': 'Relative volume on the breakout candle. The single most reliable '
-                'separator of follow-through from failure.'
-    },
-    'base_compression': {
-        'weight': 20,
-        'label': 'Base Compression',
-        'desc': 'How tight the range was immediately before the break. Energy '
-                'released from a coil travels further than a break from chop.'
-    },
-    'entry_efficiency': {
-        'weight': 15,
-        'label': 'Entry Efficiency',
-        'desc': 'Penalises chasing. Measures how far price has already run beyond '
-                'VWAP and the level, in ATR units.'
-    },
-    'momentum_align': {
-        'weight': 10,
-        'label': 'Intraday Momentum',
-        'desc': 'Price versus session VWAP and the EMA 20/50 stack on the trading '
-                'timeframe.'
-    },
-    # Optional sixth factor - off by default. See BLAST_FACTOR_KEY below.
-    'blast_thrust': {
-        'weight': 15,
-        'label': 'Thrust Expansion',
-        'desc': 'Gamma-blast proxy. Volatility regime expansion (ATR vs its own '
-                '20-bar average) plus rate-of-change thrust. Measures whether the '
-                'move is ACCELERATING, which a level break alone does not tell you.'
-    },
-}
-
-BLAST_FACTOR_KEY = 'blast_thrust'
-
-# Factors used unless the blast factor is switched on
-CORE_FACTOR_KEYS = [k for k in BREAKOUT_FACTORS if k != BLAST_FACTOR_KEY]
-
-
-def detect_gamma_blast(feat, bullish, sensitivity=1.5, vol_mult=2.0,
-                       rsi_bull=70.0, rsi_bear=30.0, score_floor=50.0):
+def evaluate_blast(feat, spike_only=False, min_score=50.0):
     """
-    Boolean blast flag, reproducing the Pine v5 gamma_blast condition:
+    Accept or reject a candidate on the blast condition alone.
 
-        high_volume       : volume_ratio > vol_mult
-        extreme RSI       : rsi > 70 (bull) / rsi < 30 (bear)
-        strong momentum   : |ROC| > sensitivity, in the trade direction
-        vol expansion     : ATR / SMA(ATR,20) > 1.2
-
-    The Pine 'spike' additionally requires gamma_score > 50.
+    Returns None when the blast is not firing, so nothing reaches the results
+    table unless the full Pine condition is satisfied.
     """
-    if not feat:
-        return False, False
-    mom = feat.get('price_momentum', 0.0)
-    directional_mom = mom if bullish else -mom
-    cond = (
-        feat.get('rel_volume', 0) > vol_mult
-        and (feat.get('rsi', 50) > rsi_bull if bullish else feat.get('rsi', 50) < rsi_bear)
-        and directional_mom > sensitivity
-        and feat.get('vol_expansion', 1.0) > 1.2
-    )
-    spike = bool(cond and feat.get('gamma_score', 0.0) > score_floor)
-    return bool(cond), spike
-
-
-def score_breakout(feat, direction="Bullish Breakout", rel_vol_threshold=1.5,
-                   donchian_len=20, veto_exhaustion=True,
-                   use_blast_factor=False, blast_sensitivity=1.5, blast_vol_mult=2.0):
-    """
-    Score a breakout on five graded factors.
-
-    Returns None if the structural break did not occur, if volume did not
-    confirm, or if the exhaustion veto fires. Otherwise returns a composite
-    0-100 score plus the per-factor breakdown.
-    """
-    if not feat:
+    if not feat or not feat.get('blast'):
+        return None
+    if spike_only and not feat.get('spike'):
+        return None
+    if feat.get('gamma_score', 0.0) < min_score:
         return None
 
-    bullish = direction.startswith("Bullish")
-    atr = feat['atr'] if feat['atr'] and feat['atr'] > 0 else None
-    price = feat['price']
-    level = feat.get('don_high') if bullish else feat.get('don_low')
+    # The three additive terms of the Pine score, exposed so you can see which
+    # one is carrying the signal. Volume-only blasts behave differently from
+    # volatility-expansion blasts.
+    vol_component = (feat['vol_ratio'] - 1) * 25
+    mom_component = abs(feat['momentum']) * 2
+    exp_component = (feat['vol_expansion'] - 1) * 50
 
-    # ---- Structural gate: the break itself must exist -----------------------
-    if not level or not atr:
-        return None
-    broke = (price > level) if bullish else (price < level)
-    if not broke:
-        return None
+    if feat['spike']:
+        signal = "💥 Spike"
+    else:
+        signal = "⚡ Blast"
 
-    # ---- Volume gate -------------------------------------------------------
-    rel_vol = feat['rel_volume']
-    if rel_vol < rel_vol_threshold:
-        return None
-
-    # ---- Exhaustion veto ---------------------------------------------------
-    # An anti-criterion: more useful than rewarding "RSI is high". A break that
-    # is already 3+ ATR beyond VWAP with RSI at an extreme is where breakout
-    # buyers become exit liquidity.
-    extension = abs(price - feat['vwap']) / atr if feat.get('vwap') else 0.0
-    if veto_exhaustion:
-        if bullish and feat['rsi'] > 85 and extension > 3.0:
-            return None
-        if (not bullish) and feat['rsi'] < 15 and extension > 3.0:
-            return None
-
-    factors = {}
-
-    # ---- 1. Breakout quality (30) -----------------------------------------
-    margin = (price - level) / atr if bullish else (level - price) / atr
-    m_score = _clip01(margin / 0.5)                              # full credit at 0.5 ATR
-    touch_score = _clip01(feat['touches'] / 4.0)                 # a tested level matters
-    base_score = _clip01(feat['base_len'] / (2.0 * donchian_len))
-    factors['range_break'] = 0.45 * m_score + 0.30 * touch_score + 0.25 * base_score
-
-    # ---- 2. Volume confirmation (25) --------------------------------------
-    # Zero credit at average volume, full credit at 3x.
-    factors['volume_thrust'] = _clip01((rel_vol - 1.0) / 2.0)
-
-    # ---- 3. Base compression (20) -----------------------------------------
-    factors['base_compression'] = _clip01(feat['compression'])
-
-    # ---- 4. Entry efficiency (15) -----------------------------------------
-    # Full credit within 1 ATR of VWAP, decaying to zero by 4 ATR.
-    ext_score = _clip01((4.0 - extension) / 3.0)
-    chase = margin                                               # already in ATR units
-    chase_score = _clip01((3.0 - chase) / 2.0)                   # punish >1 ATR past level
-    factors['entry_efficiency'] = 0.6 * ext_score + 0.4 * chase_score
-
-    # ---- 5. Intraday momentum (10) ----------------------------------------
-    vwap_ok = (price > feat['vwap']) if bullish else (price < feat['vwap'])
-    ema_ok = (price > feat['ema20'] > feat['ema50']) if bullish else (price < feat['ema20'] < feat['ema50'])
-    close_str = feat['closing_strength'] if bullish else (1 - feat['closing_strength'])
-    factors['momentum_align'] = (0.4 * (1.0 if vwap_ok else 0.0)
-                                 + 0.35 * (1.0 if ema_ok else 0.0)
-                                 + 0.25 * _clip01((close_str - 0.4) / 0.4))
-
-    # ---- 6. Thrust expansion / gamma blast (15, OPTIONAL) ------------------
-    # Deliberately excludes the volume term of the Pine formula: relative volume
-    # is already factor 2, and double-counting it would inflate scores for the
-    # same evidence. Only the two non-redundant components are used here.
-    if use_blast_factor:
-        expansion_score = _clip01((feat.get('vol_expansion', 1.0) - 1.0) / 0.5)
-        mom = feat.get('price_momentum', 0.0)
-        directional_mom = mom if bullish else -mom
-        thrust_score = _clip01(directional_mom / (2.0 * max(blast_sensitivity, 0.1)))
-        factors[BLAST_FACTOR_KEY] = 0.5 * expansion_score + 0.5 * thrust_score
-
-    # Normalise over the weights actually in play, so the composite stays on a
-    # 0-100 scale whether or not the sixth factor is enabled. With the blast
-    # factor off the arithmetic is identical to before.
-    active_weight = sum(BREAKOUT_FACTORS[k]['weight'] for k in factors)
-    composite = (sum(BREAKOUT_FACTORS[k]['weight'] * v for k, v in factors.items())
-                 / active_weight * 100) if active_weight else 0.0
-
-    blast_on, blast_spike = detect_gamma_blast(
-        feat, bullish, sensitivity=blast_sensitivity, vol_mult=blast_vol_mult
-    )
-
-    # Freshness: did the break happen on this candle, or is it already extended?
-    prev_level = feat.get('don_high_prev') if bullish else feat.get('don_low_prev')
-    fresh = False
-    if prev_level:
-        fresh = (feat['prev_bar_close'] <= prev_level) if bullish else (feat['prev_bar_close'] >= prev_level)
+    stage = "🆕 New" if not feat.get('blast_prev') else f"🔁 Bar {feat['streak']}"
 
     return {
-        'score': round(composite, 1),
-        'factors': {k: round(v * 100) for k, v in factors.items()},
-        'fresh': fresh,
-        'breakout_level': level,
-        'margin_atr': margin,
-        'extension_atr': extension,
-        'blast': blast_on,
-        'blast_spike': blast_spike,
+        'score': round(feat['gamma_score'], 1),
+        'signal': signal,
+        'stage': stage,
+        'vol_component': vol_component,
+        'mom_component': mom_component,
+        'exp_component': exp_component,
     }
 
 
@@ -2230,43 +1918,39 @@ def enrich_with_valuation(rows, show_progress=True):
 # ---------------------------------------------------------------------------
 # MAIN SCREENER PIPELINE
 # ---------------------------------------------------------------------------
-def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout",
-                          rel_vol_threshold=1.5, min_price=10.0, min_avg_volume=25000,
-                          donchian_len=20, min_score=55, max_results=40, chunk_size=25,
-                          trend_mode="Strict (HTF + Daily)", veto_exhaustion=True,
-                          final_rank="Breakout Score", include_valuation=True,
-                          use_blast_factor=False, blast_sensitivity=1.5,
-                          blast_vol_mult=2.0, blast_only=False):
+def run_blast_screener(universe, timeframe_label, direction="Bullish Blast",
+                       rsi_len=14, vol_ma_len=20, mom_len=10, sensitivity=1.5,
+                       vol_mult=2.0, rsi_bull=70.0, rsi_bear=30.0,
+                       score_floor=50.0, min_score=50.0, spike_only=False,
+                       min_price=10.0, min_avg_volume=25000, max_results=40,
+                       chunk_size=25, final_rank="Gamma Score",
+                       include_valuation=True):
     """
-    Purely technical three-stage funnel:
+    Single-criterion screener: the Gamma Blast condition, nothing else.
 
-      1. Technical  - five-factor breakout score on the trading timeframe
-      2. Trend      - multi-timeframe alignment gate (HTF + daily)
-      3. Valuation  - fair value and upside, DISPLAY ONLY
-
-    Stage 3 never removes a stock. Fundamentals are shown so you can judge
-    what broke out; they are not permitted to veto a valid technical setup.
+    There is no breakout-structure model, no multi-timeframe trend gate and no
+    exhaustion veto. A stock appears if and only if the Pine blast condition is
+    firing on the selected timeframe. Fair value and upside are attached
+    afterwards for context and never remove a row.
     """
-    cfg = INTRADAY_TIMEFRAMES.get(timeframe_label, INTRADAY_TIMEFRAMES["15 Minute"])
+    cfg = SCREENER_TIMEFRAMES.get(timeframe_label, SCREENER_TIMEFRAMES["15 Minute"])
     bullish = direction.startswith("Bullish")
     tickers = list(universe.keys())
     total = len(tickers)
-    funnel = {'scanned': 0, 'broke_out': 0, 'trend_aligned': 0,
-              'final': 0, 'no_daily_data': 0, 'blast': 0}
+    funnel = {'scanned': 0, 'with_data': 0, 'blast': 0, 'spike': 0, 'final': 0}
 
     if total == 0:
         return pd.DataFrame(), funnel
 
-    # ---------------- STAGE 1: technical scan ----------------
-    candidates = []
+    rows = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     processed = 0
 
     for start in range(0, total, chunk_size):
         chunk = tickers[start:start + chunk_size]
-        status_text.text(f"⚡ Stage 1/4 — scanning {cfg['label']} candles... "
-                         f"{processed}/{total} | breakouts: {len(candidates)}")
+        status_text.text(f"⚡ Scanning {cfg['label']} candles... "
+                         f"{processed}/{total} | blasts: {len(rows)}")
         data_map = fetch_intraday_batch(tuple(chunk), cfg['interval'], cfg['period'])
 
         for ticker in chunk:
@@ -2280,46 +1964,61 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
             df = data_map.get(ticker)
             if df is None or df.empty:
                 continue
+            funnel['with_data'] += 1
 
-            feat = compute_intraday_features(df, donchian_len)
+            feat = compute_blast_features(
+                df, cfg, rsi_len=rsi_len, vol_ma_len=vol_ma_len, mom_len=mom_len,
+                sensitivity=sensitivity, vol_mult=vol_mult, rsi_bull=rsi_bull,
+                rsi_bear=rsi_bear, score_floor=score_floor, bullish=bullish
+            )
             if not feat:
                 continue
             if feat['price'] < min_price or (feat['avg_volume'] or 0) < min_avg_volume:
                 continue
 
-            verdict = score_breakout(feat, direction, rel_vol_threshold,
-                                     donchian_len, veto_exhaustion,
-                                     use_blast_factor=use_blast_factor,
-                                     blast_sensitivity=blast_sensitivity,
-                                     blast_vol_mult=blast_vol_mult)
+            if feat.get('blast'):
+                funnel['blast'] += 1
+            if feat.get('spike'):
+                funnel['spike'] += 1
+
+            verdict = evaluate_blast(feat, spike_only=spike_only, min_score=min_score)
             if not verdict:
                 continue
 
-            funnel['broke_out'] += 1
-            candidates.append({'ticker': ticker, 'feat': feat, 'verdict': verdict,
-                               'htf': compute_htf_trend(df, cfg['htf_rule'])})
+            vwap_dist = ((feat['price'] - feat['vwap']) / feat['vwap'] * 100) if feat.get('vwap') else None
 
-    # ---------------- STAGE 2: multi-timeframe trend gate ----------------
-    survivors = []
-    if candidates:
-        status_text.text(f"📈 Stage 2/4 — checking daily trend for {len(candidates)} breakouts...")
-        cand_tickers = [c['ticker'] for c in candidates]
-        daily_map = {}
-        for start in range(0, len(cand_tickers), chunk_size):
-            daily_map.update(fetch_daily_batch(tuple(cand_tickers[start:start + chunk_size]), "1y"))
-
-        for c in candidates:
-            raw_daily = daily_map.get(c['ticker'])
-            daily = compute_daily_trend(raw_daily)
-            if daily['label'] == 'Unknown':
-                # No daily history came back. Count it so a network failure is
-                # visible in the funnel rather than looking like a strict filter.
-                funnel['no_daily_data'] += 1
-            if not trend_gate_passes(daily, c['htf'], trend_mode, bullish):
-                continue
-            c['daily'] = daily
-            funnel['trend_aligned'] += 1
-            survivors.append(c)
+            rows.append({
+                'Ticker': ticker,
+                'Name': universe.get(ticker, ticker),
+                'Timeframe': cfg['label'],
+                'LTP': feat['price'],
+                'Fair Value': None,
+                'Upside %': None,
+                'Value Tag': None,
+                'Chg %': feat['day_change_pct'],
+                'Signal': verdict['signal'],
+                'Stage': verdict['stage'],
+                'Gamma Score': verdict['score'],
+                'Blast Rank': feat['gamma_rank'] * 100,
+                'Vol Ratio': feat['vol_ratio'],
+                'Momentum %': feat['momentum'],
+                'Vol Expansion': feat['vol_expansion'],
+                'RSI': feat['rsi'],
+                'Volume': feat['last_volume'],
+                'Avg Volume': feat['avg_volume'],
+                'Session Volume': feat['session_volume'],
+                'VWAP': feat['vwap'],
+                'VWAP Dist %': vwap_dist,
+                'ATR %': feat['atr_pct'],
+                'Streak': feat['streak'],
+                'Blasts/100': feat['blast_freq'],
+                'Vol Term': verdict['vol_component'],
+                'Mom Term': verdict['mom_component'],
+                'Exp Term': verdict['exp_component'],
+                'Last Candle': feat['last_bar_time'].strftime('%d-%b %H:%M')
+                               if hasattr(feat['last_bar_time'], 'strftime') else str(feat['last_bar_time']),
+                'Valuation': build_valuation_link(ticker),
+            })
 
     try:
         progress_bar.empty()
@@ -2327,91 +2026,26 @@ def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout
     except Exception:
         pass
 
-    if not survivors:
+    if not rows:
         return pd.DataFrame(), funnel
 
-    # Rank technically, then keep a buffer so the quality gate has room to cut
-    survivors.sort(key=lambda c: c['verdict']['score'], reverse=True)
-    survivors = survivors[:max(max_results * 3, max_results)]
+    # Rank first, then value only the survivors
+    rows.sort(key=lambda r: r['Gamma Score'], reverse=True)
+    rows = rows[:max_results]
 
-    rows = []
-    for c in survivors:
-        feat, v, daily, htf = c['feat'], c['verdict'], c['daily'], c['htf']
-        vwap_dist = ((feat['price'] - feat['vwap']) / feat['vwap'] * 100) if feat.get('vwap') else None
-        rows.append({
-            'Ticker': c['ticker'],
-            'Name': universe.get(c['ticker'], c['ticker']),
-            'Timeframe': cfg['label'],
-            'LTP': feat['price'],
-            'Fair Value': None,
-            'Upside %': None,
-            'Value Tag': None,
-            'Day Chg %': feat['day_change_pct'],
-            'Score': v['score'],
-            'Setup': ("🆕 Fresh" if v['fresh'] else "🔁 Extended") +
-                     (" Breakout" if bullish else " Breakdown"),
-            'Daily Trend': daily['label'],
-            f"{cfg['htf_label']} Trend": htf['label'],
-            'Breakout Level': v['breakout_level'],
-            'Margin (ATR)': v['margin_atr'],
-            'Extension (ATR)': v['extension_atr'],
-            'Volume': feat['last_volume'],
-            'Avg Volume': feat['avg_volume'],
-            'Rel Vol': feat['rel_volume'],
-            'Session Volume': feat['session_volume'],
-            'VWAP': feat['vwap'],
-            'VWAP Dist %': vwap_dist,
-            'RSI': feat['rsi'],
-            'ATR %': feat['atr_pct'],
-            'Gamma Score': feat['gamma_score'],
-            'Blast Rank': feat['gamma_rank'] * 100,
-            'Vol Expansion': feat['vol_expansion'],
-            'Momentum %': feat['price_momentum'],
-            'Blast': bool(v.get('blast')),
-            'Blast Spike': bool(v.get('blast_spike')),
-            'Base Bars': feat['base_len'],
-            'Level Touches': feat['touches'],
-            'Breakout Quality': v['factors']['range_break'],
-            'Volume Confirmation': v['factors']['volume_thrust'],
-            'Base Compression': v['factors']['base_compression'],
-            'Entry Efficiency': v['factors']['entry_efficiency'],
-            'Intraday Momentum': v['factors']['momentum_align'],
-            'Thrust Expansion': v['factors'].get(BLAST_FACTOR_KEY),
-            'Last Candle': feat['last_bar_time'].strftime('%d-%b %H:%M')
-                           if hasattr(feat['last_bar_time'], 'strftime') else str(feat['last_bar_time']),
-            'Valuation': build_valuation_link(c['ticker']),
-        })
-
-    # ---------------- STAGE 3: valuation (display only) ----------------
     if include_valuation:
         rows = enrich_with_valuation(rows)
 
     df_out = pd.DataFrame(rows)
-    if df_out.empty:
-        return df_out, funnel
 
-    if 'Blast' in df_out.columns:
-        funnel['blast'] = int(df_out['Blast'].sum())
-
-    # Optional hard gate: only setups that also fire the Pine blast condition
-    if blast_only and 'Blast' in df_out.columns:
-        df_out = df_out[df_out['Blast']]
-        if df_out.empty:
-            return df_out, funnel
-
-    df_out = df_out[df_out['Score'] >= min_score]
-    if df_out.empty:
-        return df_out, funnel
-
-    # ---------------- Final ranking ----------------
     if final_rank == "Upside %" and 'Upside %' in df_out.columns:
         df_out = df_out.sort_values('Upside %', ascending=False, na_position='last')
-    elif final_rank == "Gamma Score" and 'Gamma Score' in df_out.columns:
-        df_out = df_out.sort_values('Gamma Score', ascending=False, na_position='last')
+    elif final_rank == "Blast Rank" and 'Blast Rank' in df_out.columns:
+        df_out = df_out.sort_values('Blast Rank', ascending=False, na_position='last')
     else:
-        df_out = df_out.sort_values(['Score', 'Rel Vol'], ascending=[False, False])
+        df_out = df_out.sort_values('Gamma Score', ascending=False)
 
-    df_out = df_out.head(max_results).reset_index(drop=True)
+    df_out = df_out.reset_index(drop=True)
     funnel['final'] = len(df_out)
     return df_out, funnel
 
@@ -2765,7 +2399,7 @@ def main():
     # ------------------------------------------------------------------
     MODE_OPTIONS = [
         "🎯 Industry Screener",
-        "⚡ Breakout Screener (1H / 15M)",
+        "⚡ Gamma Blast Screener",
         "📈 Individual Analysis",
         "📊 Industry Explorer"
     ]
@@ -2997,34 +2631,24 @@ def main():
                     use_container_width=True
                 )
     
-    elif mode == "⚡ Breakout Screener (1H / 15M)":
+    elif mode == "⚡ Gamma Blast Screener":
         
-        st.markdown("### ⚡ Multi-Timeframe Breakout Screener")
-        st.caption("Trades the 15m / 1H chart, but only in stocks already trending on the "
-                   "higher timeframe. Purely technical — fundamentals are shown, never filtered on.")
+        st.markdown("### ⚡ Gamma Blast Screener")
+        st.caption("A direct port of the Nyztrade Gamma Flow indicator. One criterion only: "
+                   "the blast condition. No breakout structure model, no trend confirmation.")
         
         # ---------------- Sidebar controls ----------------
         st.sidebar.markdown("### ⏱️ Timeframe & Direction")
         
         timeframe_label = st.sidebar.selectbox(
-            "Trading Timeframe",
-            list(INTRADAY_TIMEFRAMES.keys()),
-            index=0,
-            help="15 Minute confirms against 1H + Daily. 1 Hour confirms against 4H + Daily."
+            "Timeframe",
+            list(SCREENER_TIMEFRAMES.keys()),
+            index=0
         )
-        _cfg = INTRADAY_TIMEFRAMES[timeframe_label]
-        st.sidebar.caption(f"Stack: **{_cfg['label']}** entry → **{_cfg['htf_label']}** confirm → **Daily** trend")
+        _cfg = SCREENER_TIMEFRAMES[timeframe_label]
+        st.sidebar.caption(_cfg['note'])
         
-        direction = st.sidebar.radio("Direction", ["Bullish Breakout", "Bearish Breakdown"])
-        
-        st.sidebar.markdown("### 📈 Trend Filter")
-        trend_mode = st.sidebar.selectbox(
-            "Multi-Timeframe Alignment",
-            list(TREND_MODES.keys()),
-            index=0,
-            help="Strict = both the intraday higher timeframe AND the daily trend must agree "
-                 "with the breakout direction. This is what keeps you out of counter-trend traps."
-        )
+        direction = st.sidebar.radio("Direction", ["Bullish Blast", "Bearish Blast"])
         
         st.sidebar.markdown("### 🌐 Universe")
         universe_mode = st.sidebar.selectbox(
@@ -3054,241 +2678,197 @@ def main():
             custom_input = st.sidebar.text_area(
                 "Tickers (comma or newline separated)",
                 placeholder="RELIANCE.NS, TCS.NS, HDFCBANK.NS",
-                height=110
+                height=120
             )
             raw = [x.strip().upper() for x in custom_input.replace("\n", ",").split(",") if x.strip()]
             raw = [x if x.endswith(('.NS', '.BO')) else f"{x}.NS" for x in raw]
             universe = {t: t.replace('.NS', '').replace('.BO', '') for t in raw}
             universe_label = "Custom List"
         
-        st.sidebar.markdown("### 🎚️ Breakout Filters")
-        donchian_len = st.sidebar.slider("Breakout Lookback (bars)", 5, 60, 20)
-        rel_vol_threshold = st.sidebar.slider("Min Relative Volume", 0.8, 5.0, 1.5, 0.1,
-                                              help="Hard gate. Breakouts below average volume fail disproportionately.")
-        min_score = st.sidebar.slider("Min Composite Score", 0, 100, 50, 5)
-        veto_exhaustion = st.sidebar.checkbox(
-            "Veto exhausted moves", value=True,
-            help="Rejects breakouts already 3+ ATR beyond VWAP with an extreme RSI — "
-                 "the point where breakout buyers become exit liquidity."
+        # ---------------- Pine indicator inputs ----------------
+        st.sidebar.markdown("### 💥 Blast Parameters")
+        st.sidebar.caption("These map 1:1 to the inputs in your Pine indicator.")
+        
+        vol_mult = st.sidebar.slider(
+            "Volume Threshold Multiplier", 1.0, 5.0, 2.0, 0.1,
+            help="volume_threshold — volume must exceed this multiple of its moving average."
         )
-        st.sidebar.markdown("### ⚡ Gamma Blast Proxy")
-        use_blast_factor = st.sidebar.checkbox(
-            "Add Thrust Expansion as 6th factor", value=False,
-            help="Adds volatility expansion + rate-of-change thrust to the composite "
-                 "score (weight 15, renormalised to 0-100). Off by default so scores "
-                 "stay comparable with earlier scans."
+        sensitivity = st.sidebar.slider(
+            "Gamma Blast Sensitivity", 0.5, 3.0, 1.5, 0.1,
+            help="sensitivity — minimum rate of change, in percent, in the trade direction."
         )
-        blast_only = st.sidebar.checkbox(
-            "Only show Gamma Blast setups", value=False,
-            help="Hard gate: keeps only breakouts that ALSO satisfy the full Pine "
-                 "blast condition. Expect very few hits — this is a rare signal."
+        mom_len = st.sidebar.slider(
+            "Momentum Length", 2, 50, 10,
+            help="momentum_length — lookback for the rate of change calculation."
         )
-        blast_sensitivity = st.sidebar.slider(
-            "Blast Sensitivity (ROC %)", 0.2, 3.0, 1.5, 0.1,
-            help="Minimum 10-bar rate of change, in the trade direction. "
-                 "Matches the 'sensitivity' input in your Pine indicator."
+        vol_ma_len = st.sidebar.slider(
+            "Volume MA Length", 5, 60, 20,
+            help="volume_ma_length — baseline for the volume ratio."
         )
-        blast_vol_mult = st.sidebar.slider(
-            "Blast Volume Multiplier", 1.0, 5.0, 2.0, 0.25,
-            help="Volume ratio required for the blast flag. Matches "
-                 "'volume_threshold' in the Pine indicator."
+        rsi_len = st.sidebar.slider(
+            "RSI Length", 2, 50, 14,
+            help="length — RSI period."
         )
         
+        with st.sidebar.expander("RSI thresholds"):
+            rsi_bull = st.slider("Bullish RSI above", 50.0, 90.0, 70.0, 1.0)
+            rsi_bear = st.slider("Bearish RSI below", 10.0, 50.0, 30.0, 1.0)
+        
+        st.sidebar.markdown("### 🎚️ Result Filters")
+        spike_only = st.sidebar.checkbox(
+            "Spikes only (gamma > floor)", value=False,
+            help="The Pine 'spike' marker: a blast that also clears the score floor. "
+                 "Fewer, stronger signals."
+        )
+        score_floor = st.sidebar.slider("Spike Score Floor", 0, 200, 50, 5)
+        min_score = st.sidebar.slider("Min Gamma Score", 0, 200, 0, 5,
+                                      help="Applies to every result, not just spikes.")
         min_price = st.sidebar.number_input("Min Price (₹)", min_value=1.0, value=20.0, step=5.0)
-        min_avg_volume = st.sidebar.number_input("Min Avg Bar Volume", min_value=0, value=25000, step=5000)
+        min_avg_volume = st.sidebar.number_input("Min Avg Bar Volume", min_value=0,
+                                                 value=25000, step=5000)
         max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="bo_max_results")
         
         st.sidebar.markdown("### 💰 Valuation (display only)")
         include_valuation = st.sidebar.checkbox(
             "Show Fair Value & Upside %", value=True,
-            help="Adds Fair Value, Upside % and PE to the results table. These are "
-                 "informational only — they never filter a stock out. Untick for the "
-                 "fastest possible scan."
+            help="Informational columns only — they never filter a stock out."
         )
-        if include_valuation:
-            st.sidebar.caption("👁️ Shown for context and ranking — nothing is filtered out.")
-        else:
-            st.sidebar.caption("⚡ Fastest scan — pure technicals, no valuation columns.")
         
         final_rank = st.sidebar.selectbox(
-            "Rank results by",
-            ["Breakout Score", "Gamma Score", "Upside %"],
-            help="Ranking by Upside %% only re-orders the same technical results — "
-                 "it never removes a setup."
+            "Rank results by", ["Gamma Score", "Blast Rank", "Upside %"]
         )
         
-        with st.expander("📚 Why only five criteria?"):
-            st.markdown(f"""
-The earlier version of this screener scored eleven criteria. That sounds thorough, but most of
-them measured the **same underlying thing** — an N-bar range break, an opening-range break and a
-previous-day-high break all mean "price is above a recent high", so they fired together and the
-composite score clustered in a narrow band. When factors are collinear, a score of 83 versus 65
-carries almost no information.
+        with st.expander("📐 What the Gamma Score measures"):
+            st.markdown("""
+The score is the sum of three terms, exactly as in the Pine indicator:
 
-This version uses **five graded factors** (0–100 each, not pass/fail), chosen to be as independent
-of each other as possible:
-
-| Factor | Weight | What it measures |
+| Term | Formula | Reads as |
 |---|---|---|
-| **{BREAKOUT_FACTORS['range_break']['label']}** | {BREAKOUT_FACTORS['range_break']['weight']} | {BREAKOUT_FACTORS['range_break']['desc']} |
-| **{BREAKOUT_FACTORS['volume_thrust']['label']}** | {BREAKOUT_FACTORS['volume_thrust']['weight']} | {BREAKOUT_FACTORS['volume_thrust']['desc']} |
-| **{BREAKOUT_FACTORS['base_compression']['label']}** | {BREAKOUT_FACTORS['base_compression']['weight']} | {BREAKOUT_FACTORS['base_compression']['desc']} |
-| **{BREAKOUT_FACTORS['entry_efficiency']['label']}** | {BREAKOUT_FACTORS['entry_efficiency']['weight']} | {BREAKOUT_FACTORS['entry_efficiency']['desc']} |
-| **{BREAKOUT_FACTORS['momentum_align']['label']}** | {BREAKOUT_FACTORS['momentum_align']['weight']} | {BREAKOUT_FACTORS['momentum_align']['desc']} |
+| **Volume** | `(volume_ratio − 1) × 25` | How far above its own average the volume is |
+| **Momentum** | `abs(price_momentum) × 2` | Rate of change over the momentum lookback |
+| **Expansion** | `(volatility_expansion − 1) × 50` | ATR against its own 20-bar average |
 
-**Structural conditions are gates, not points.** Trend alignment, volume confirmation and liquidity
-either pass or the stock is dropped. A breakout against the daily trend is not
-"a slightly lower score" — it is a different and worse trade, so no amount of chart beauty should
-let it through.
+A stock reaches this table only when **all four** blast conditions hold at once:
+volume above the multiplier, RSI beyond its threshold, rate of change beyond
+sensitivity in the trade direction, and ATR expansion above 1.2.
 
-**Entry Efficiency is an anti-criterion.** It *subtracts* for a move that has already run. Most
-screeners rank the biggest movers to the top, which is precisely the list of stocks you are too
-late to buy.
-
-**The scan runs as a funnel:** technical → trend → valuation. Each stage is more expensive than the
-last, so the per-stock valuation calls only ever touch a handful of survivors. The valuation stage
-is display-only — it labels what came through, it never removes anything.
+Two caveats worth holding onto. The momentum term uses an absolute value, so the
+score itself is direction-blind — direction comes from the condition, not the
+number. And **Blast Rank** matters more than the raw score: a reading of 70 is
+routine on a habitually volatile counter and extraordinary on a quiet one. The
+**Blasts/100** column tells you how often the name fires at all; a stock showing
+30 blasts per 100 bars is not signalling anything.
             """)
         
-        if st.sidebar.button("⚡ Run Breakout Scan", type="primary"):
+        if st.sidebar.button("⚡ Run Blast Scan", type="primary"):
             if not universe:
                 st.warning("❌ No tickers in the selected universe.")
             else:
                 st.markdown(f'''
                 <div class="highlight-box">
-                    <h3>⚡ {direction} — {timeframe_label} entry</h3>
+                    <h3>⚡ {direction} — {timeframe_label}</h3>
                     <p><strong>Universe:</strong> {universe_label} ({len(universe):,} stocks)</p>
-                    <p><strong>Trend Filter:</strong> {trend_mode} &nbsp;•&nbsp;
-                       <strong>Lookback:</strong> {donchian_len} bars &nbsp;•&nbsp;
-                       <strong>Min Rel Vol:</strong> {rel_vol_threshold:.1f}x</p>
+                    <p><strong>Volume ×:</strong> {vol_mult:.1f} &nbsp;•&nbsp;
+                       <strong>Sensitivity:</strong> {sensitivity:.1f}% &nbsp;•&nbsp;
+                       <strong>Momentum:</strong> {mom_len} bars</p>
                 </div>
                 ''', unsafe_allow_html=True)
                 
-                with st.spinner(f"Running 4-stage funnel over {len(universe):,} stocks..."):
-                    bo_df, funnel = run_breakout_screener(
+                with st.spinner(f"⚡ Scanning {len(universe):,} stocks..."):
+                    bo_df, bo_funnel = run_blast_screener(
                         universe=universe,
                         timeframe_label=timeframe_label,
                         direction=direction,
-                        rel_vol_threshold=rel_vol_threshold,
+                        rsi_len=rsi_len,
+                        vol_ma_len=vol_ma_len,
+                        mom_len=mom_len,
+                        sensitivity=sensitivity,
+                        vol_mult=vol_mult,
+                        rsi_bull=rsi_bull,
+                        rsi_bear=rsi_bear,
+                        score_floor=score_floor,
+                        min_score=min_score,
+                        spike_only=spike_only,
                         min_price=min_price,
                         min_avg_volume=min_avg_volume,
-                        donchian_len=donchian_len,
-                        min_score=min_score,
                         max_results=max_results,
-                        trend_mode=trend_mode,
-                        veto_exhaustion=veto_exhaustion,
                         final_rank=final_rank,
-                        include_valuation=include_valuation,
-                        use_blast_factor=use_blast_factor,
-                        blast_sensitivity=blast_sensitivity,
-                        blast_vol_mult=blast_vol_mult,
-                        blast_only=blast_only
+                        include_valuation=include_valuation
                     )
                 
                 st.session_state['breakout_results'] = bo_df
-                st.session_state['breakout_funnel'] = funnel
+                st.session_state['breakout_funnel'] = bo_funnel
                 st.session_state['breakout_meta'] = {
                     'timeframe': timeframe_label,
-                    'htf_label': _cfg['htf_label'],
                     'direction': direction,
-                    'universe_label': universe_label,
-                    'trend_mode': trend_mode
+                    'universe_label': universe_label
                 }
         
-        # ---------------- Render persisted results ----------------
+        # ---------------- Render results ----------------
         bo_df = st.session_state.get('breakout_results')
         bo_meta = st.session_state.get('breakout_meta', {})
-        funnel = st.session_state.get('breakout_funnel')
-        
-        if funnel:
-            st.markdown("##### 🔻 Screening Funnel")
-            f1, f2, f3, f4 = st.columns(4)
-            f1.metric("Scanned", funnel.get('scanned', 0))
-            f2.metric("Broke Out", funnel.get('broke_out', 0))
-            f3.metric("Trend Aligned", funnel.get('trend_aligned', 0))
-            f4.metric("Final", funnel.get('final', 0))
-            
-            if funnel.get('no_daily_data'):
-                st.caption(f"⚠️ {funnel['no_daily_data']} candidate(s) had no daily history "
-                           f"returned — a data issue rather than a strict filter.")
+        bo_funnel = st.session_state.get('breakout_funnel', {})
         
         if bo_df is not None:
+            if bo_funnel:
+                f1, f2, f3, f4 = st.columns(4)
+                f1.metric("Scanned", bo_funnel.get('scanned', 0))
+                f2.metric("Had Data", bo_funnel.get('with_data', 0))
+                f3.metric("Blast Firing", bo_funnel.get('blast', 0))
+                f4.metric("Spikes", bo_funnel.get('spike', 0))
+            
             if bo_df.empty:
-                _f = funnel or {}
-                if _f.get('broke_out', 0) == 0:
-                    _tip = ("Nothing broke out. Lower **Min Relative Volume**, shorten the "
-                            "**Breakout Lookback**, or scan a more active universe.")
-                elif _f.get('trend_aligned', 0) == 0:
-                    _tip = ("Breakouts were found but none aligned with the higher timeframe. "
-                            "Switch **Multi-Timeframe Alignment** to *Daily Trend Only* or *Off*.")
-                elif _f.get('final', 0) == 0:
-                    _tip = ("Trend-aligned breakouts were found but none cleared "
-                            "**Min Composite Score**. Lower it to see the weaker setups.")
-                else:
-                    _tip = "Try lowering **Min Composite Score**."
-                st.warning("❌ No setups survived the funnel. " + _tip)
-                st.caption("The counters above show exactly which stage removed them — "
-                           "relax that stage rather than everything at once.")
+                st.warning(
+                    "❌ No blasts firing right now. This is normal — the blast condition "
+                    "requires four things to be true simultaneously and can go long stretches "
+                    "without triggering, especially outside market hours. Try a wider universe, "
+                    "a lower volume multiplier, or a lower sensitivity."
+                )
             else:
                 st.markdown(f'''
                 <div class="success-message">
-                    ✅ <strong>{len(bo_df)}</strong> {bo_meta.get('direction', direction).lower()} setups
-                    on the <strong>{bo_meta.get('timeframe', timeframe_label)}</strong> chart<br>
-                    📈 Trend filter: {bo_meta.get('trend_mode', trend_mode)} &nbsp;•&nbsp;
-                    🌐 {bo_meta.get('universe_label', universe_label)}
+                    ✅ <strong>{len(bo_df)}</strong> {bo_meta.get('direction', direction).lower()}
+                    signals on the <strong>{bo_meta.get('timeframe', timeframe_label)}</strong> chart<br>
+                    🌐 Universe: {bo_meta.get('universe_label', universe_label)}
                 </div>
                 ''', unsafe_allow_html=True)
                 
                 s1, s2, s3, s4 = st.columns(4)
-                s1.metric("Avg Score", f"{bo_df['Score'].mean():.0f}")
-                s2.metric("Avg Rel Vol", f"{bo_df['Rel Vol'].mean():.2f}x")
-                s3.metric("Fresh Breaks", int(bo_df['Setup'].str.contains('Fresh').sum()))
-                if 'Upside %' in bo_df.columns and bo_df['Upside %'].notna().any():
-                    s4.metric("Avg Upside", f"{bo_df['Upside %'].dropna().mean():+.1f}%")
-                else:
-                    s4.metric("Avg Upside", "N/A")
+                s1.metric("Signals", len(bo_df))
+                s2.metric("Avg Gamma", f"{bo_df['Gamma Score'].mean():.1f}")
+                s3.metric("Max Gamma", f"{bo_df['Gamma Score'].max():.1f}")
+                s4.metric("Spikes", int((bo_df['Signal'] == "💥 Spike").sum()))
                 
                 bo_display = bo_df.copy()
-                _htf_col = f"{bo_meta.get('htf_label', _cfg['htf_label'])} Trend"
                 
-                for col in ['LTP', 'Fair Value', 'Breakout Level', 'VWAP']:
+                for col in ['LTP', 'Fair Value', 'VWAP']:
                     if col in bo_display.columns:
                         bo_display[col] = bo_display[col].apply(
                             lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
                 
-                for col in ['Day Chg %', 'VWAP Dist %', 'Upside %', 'ROE %', 'Margin %']:
+                for col in ['Chg %', 'VWAP Dist %', 'Upside %', 'Momentum %']:
                     if col in bo_display.columns:
                         bo_display[col] = bo_display[col].apply(
                             lambda x: f"{x:+.2f}%" if pd.notna(x) else 'N/A')
                 
-                for col in ['Margin (ATR)', 'Extension (ATR)', 'Vol Expansion']:
+                for col in ['Gamma Score', 'Vol Term', 'Mom Term', 'Exp Term']:
                     if col in bo_display.columns:
                         bo_display[col] = bo_display[col].apply(
-                            lambda x: f"{x:.2f}" if pd.notna(x) else 'N/A')
+                            lambda x: f"{x:.1f}" if pd.notna(x) else 'N/A')
                 
-                if 'Gamma Score' in bo_display.columns:
-                    bo_display['Gamma Score'] = bo_display['Gamma Score'].apply(
-                        lambda x: f"{x:.1f}" if pd.notna(x) else 'N/A')
                 if 'Blast Rank' in bo_display.columns:
                     bo_display['Blast Rank'] = bo_display['Blast Rank'].apply(
                         lambda x: f"{x:.0f}%ile" if pd.notna(x) else 'N/A')
-                if 'Momentum %' in bo_display.columns:
-                    bo_display['Momentum %'] = bo_display['Momentum %'].apply(
-                        lambda x: f"{x:+.2f}%" if pd.notna(x) else 'N/A')
-                if 'Blast' in bo_display.columns:
-                    _spike = bo_display['Blast Spike'] if 'Blast Spike' in bo_display.columns else None
-                    bo_display['Blast'] = [
-                        ("💥 Spike" if (_spike is not None and bool(_spike.iloc[k]))
-                         else ("⚡ Blast" if bool(b) else "—"))
-                        for k, b in enumerate(bo_display['Blast'])
-                    ]
-                
-                if 'ATR %' in bo_display.columns:
-                    bo_display['ATR %'] = bo_display['ATR %'].apply(
-                        lambda x: f"{x:.2f}%" if pd.notna(x) else 'N/A')
+                for col in ['Vol Ratio', 'Vol Expansion']:
+                    if col in bo_display.columns:
+                        bo_display[col] = bo_display[col].apply(
+                            lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
                 if 'RSI' in bo_display.columns:
                     bo_display['RSI'] = bo_display['RSI'].apply(
                         lambda x: f"{x:.1f}" if pd.notna(x) else 'N/A')
+                if 'ATR %' in bo_display.columns:
+                    bo_display['ATR %'] = bo_display['ATR %'].apply(
+                        lambda x: f"{x:.2f}%" if pd.notna(x) else 'N/A')
                 if 'PE Ratio' in bo_display.columns:
                     bo_display['PE Ratio'] = bo_display['PE Ratio'].apply(
                         lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
@@ -3296,16 +2876,12 @@ is display-only — it labels what came through, it never removes anything.
                 for col in ['Volume', 'Avg Volume', 'Session Volume']:
                     if col in bo_display.columns:
                         bo_display[col] = bo_display[col].apply(format_volume)
-                if 'Rel Vol' in bo_display.columns:
-                    bo_display['Rel Vol'] = bo_display['Rel Vol'].apply(
-                        lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
                 
                 bo_columns = ['Ticker', 'Name', 'Timeframe', 'LTP', 'Fair Value', 'Upside %',
-                              'Value Tag', 'Score', 'Setup', 'Blast', 'Gamma Score',
-                              'Blast Rank', 'Daily Trend', _htf_col,
-                              'Breakout Level', 'Margin (ATR)', 'Volume', 'Rel Vol',
-                              'Session Volume', 'VWAP', 'VWAP Dist %', 'RSI', 'ATR %',
-                              'Vol Expansion', 'Momentum %',
+                              'Value Tag', 'Signal', 'Stage', 'Gamma Score', 'Blast Rank',
+                              'Chg %', 'Vol Ratio', 'Volume', 'Avg Volume', 'Session Volume',
+                              'Momentum %', 'Vol Expansion', 'RSI', 'ATR %',
+                              'VWAP', 'VWAP Dist %', 'Streak', 'Blasts/100',
                               'PE Ratio', 'Cap Type', 'Last Candle', 'Valuation']
                 bo_columns = [c for c in bo_columns if c in bo_display.columns]
                 
@@ -3319,19 +2895,18 @@ is display-only — it labels what came through, it never removes anything.
                 
                 render_valuation_jump(bo_df, "breakout_screener")
                 
-                with st.expander("🔬 Factor breakdown (0–100 per factor)"):
-                    st.caption("Shows WHERE each setup earned its score. Two stocks on 70 can be "
-                               "very different trades — one strong on volume, another on base quality.")
-                    factor_cols = ['Ticker', 'Score', 'Breakout Quality', 'Volume Confirmation',
-                                   'Base Compression', 'Entry Efficiency', 'Intraday Momentum',
-                                   'Thrust Expansion', 'Base Bars', 'Level Touches']
-                    factor_cols = [c for c in factor_cols if c in bo_df.columns]
-                    st.dataframe(bo_df[factor_cols], use_container_width=True, hide_index=True)
+                with st.expander("🔬 Score decomposition"):
+                    st.caption("Which of the three terms is carrying the score. A blast built "
+                               "almost entirely on the volume term is a different event from one "
+                               "built on volatility expansion.")
+                    d_cols = ['Ticker', 'Gamma Score', 'Vol Term', 'Mom Term', 'Exp Term',
+                              'Blast Rank', 'Streak', 'Blasts/100']
+                    d_cols = [c for c in d_cols if c in bo_df.columns]
+                    st.dataframe(bo_df[d_cols], use_container_width=True, hide_index=True)
                 
                 if 'Fair Value' in bo_df.columns and bo_df['Fair Value'].notna().any():
                     with st.expander("💰 Valuation detail"):
-                        st.caption("Context only — none of these figures filtered any stock "
-                                   "out of the list above.")
+                        st.caption("Context only — none of these figures filtered any stock out.")
                         q_cols = ['Ticker', 'LTP', 'Fair Value', 'Upside %', 'Value Tag',
                                   'PE Ratio', 'Cap Type']
                         q_cols = [c for c in q_cols if c in bo_df.columns]
@@ -3341,9 +2916,9 @@ is display-only — it labels what came through, it never removes anything.
                 bo_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                 bo_tf = bo_meta.get('timeframe', timeframe_label).replace(' ', '')
                 st.download_button(
-                    f"📥 Download Breakout Results ({len(bo_df)} stocks)",
+                    f"📥 Download Blast Results ({len(bo_df)} stocks)",
                     data=bo_csv,
-                    file_name=f"NYZTrade_Breakout_{bo_tf}_{bo_ts}.csv",
+                    file_name=f"NYZTrade_GammaBlast_{bo_tf}_{bo_ts}.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
