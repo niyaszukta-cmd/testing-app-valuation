@@ -1065,15 +1065,7 @@ def get_stock_fundamentals(ticker):
             'book_value': info.get('bookValue'),
             'revenue': info.get('totalRevenue'),
             'sector': info.get('sector', 'Other'),
-            'industry': info.get('industry', 'Other'),
-            # Growth / profitability fields (available for future use and for
-            # the Individual Analysis screen; the breakout screener does not filter on them)
-            'earnings_growth': info.get('earningsGrowth') or info.get('earningsQuarterlyGrowth'),
-            'revenue_growth': info.get('revenueGrowth'),
-            'operating_margin': info.get('operatingMargins'),
-            'return_on_assets': info.get('returnOnAssets'),
-            'current_ratio': info.get('currentRatio'),
-            'free_cashflow': info.get('freeCashflow')
+            'industry': info.get('industry', 'Other')
         }
         
         # Calculate additional metrics
@@ -1115,27 +1107,6 @@ def get_industry_benchmarks(industry, cap_type='Large'):
         base_benchmarks['pe'] *= multipliers['pe']
         base_benchmarks['pb'] *= multipliers['pb'] 
         base_benchmarks['ev_ebitda'] *= multipliers['ev_ebitda']
-    
-    # ---- Peer-average P/E override -----------------------------------------
-    # When enabled, the industry P/E becomes the mean trailing P/E of the
-    # stocks actually in this industry, with missing P/Es excluded rather than
-    # counted as zero. Applied AFTER the cap multipliers and deliberately not
-    # scaled by them: a measured peer average already embodies the size mix of
-    # the industry, so multiplying again would double-count it.
-    try:
-        if st.session_state.get('use_peer_pe'):
-            peer = compute_peer_industry_pe(
-                industry,
-                max_sample=int(st.session_state.get('peer_pe_sample', 60)),
-                pe_cap=float(st.session_state.get('peer_pe_cap', 200.0))
-            )
-            min_n = int(st.session_state.get('peer_pe_min_n', 3))
-            if peer and peer.get('n', 0) >= min_n and peer.get('mean'):
-                base_benchmarks['pe'] = peer['mean']
-                base_benchmarks['pe_source'] = 'peer'
-                base_benchmarks['peer_n'] = peer['n']
-    except Exception:
-        pass
     
     return base_benchmarks
 
@@ -1445,26 +1416,29 @@ def search_stocks_by_name(query, max_results=50):
     return results
 
 # ============================================================================
-# EARNINGS + VALUE SCREENER
-# ----------------------------------------------------------------------------
-# DESIGN NOTES
-#
-# Exactly three criteria, and no technical/momentum model at all:
-#
-#   1. Price is near its 52-week high
-#   2. Price is below the fair value estimate
-#   3. Earnings fall inside a chosen calendar window
-#
-# The stages run cheapest-first. Stage 1 works from batched daily bars and
-# typically removes most of a universe for the cost of a few requests. Only
-# the survivors reach the per-ticker calls in stages 2 and 3, both of which
-# are cached (fair value 1h, earnings dates 1h).
-#
-# The two earnings windows are OPPOSITE trades and the UI says so. "Reported
-# in the last N days" is post-earnings drift: the event is behind you and the
-# surprise is known. "Due in the next N days" means holding through a binary
-# event, where a gap passes straight through a stop.
+# LOWER TIMEFRAME BREAKOUT SCREENER ENGINE (1 HOUR / 15 MINUTE)
 # ============================================================================
+
+# Timeframe configuration for intraday screening
+INTRADAY_TIMEFRAMES = {
+    "15 Minute": {
+        "interval": "15m",
+        "period": "30d",
+        "bars_per_day": 25,
+        "orb_bars": 4,          # First 1 hour = 4 x 15min candles
+        "min_bars": 60,
+        "label": "15m"
+    },
+    "1 Hour": {
+        "interval": "1h",
+        "period": "90d",
+        "bars_per_day": 7,
+        "orb_bars": 1,          # First 1 hour candle
+        "min_bars": 60,
+        "label": "1H"
+    }
+}
+
 
 def _ns(symbols):
     """Helper to append NSE suffix to a list of raw symbols"""
@@ -1513,8 +1487,48 @@ BREAKOUT_PRESET_UNIVERSES = {
 
 
 # ---------------------------------------------------------------------------
-# Indicator helpers
+# Indicator helpers for intraday timeframes
 # ---------------------------------------------------------------------------
+def calculate_rsi(series, period=14):
+    """Wilder's RSI"""
+    try:
+        delta = series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+    except Exception:
+        return pd.Series(index=series.index, dtype=float)
+
+
+def calculate_atr_series(high, low, close, period=14):
+    """Average True Range series"""
+    try:
+        tr1 = high - low
+        tr2 = (high - close.shift()).abs()
+        tr3 = (low - close.shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.ewm(alpha=1 / period, adjust=False).mean()
+    except Exception:
+        return pd.Series(index=close.index, dtype=float)
+
+
+def calculate_session_vwap(df):
+    """Session-anchored VWAP (resets every trading day) - the true intraday VWAP"""
+    try:
+        typical = (df['High'] + df['Low'] + df['Close']) / 3.0
+        volume = df['Volume'].fillna(0)
+        session_key = pd.Series(pd.to_datetime(df.index).date, index=df.index)
+        cum_pv = (typical * volume).groupby(session_key).cumsum()
+        cum_vol = volume.groupby(session_key).cumsum()
+        vwap = cum_pv / cum_vol.replace(0, np.nan)
+        return vwap.ffill()
+    except Exception:
+        return pd.Series(index=df.index, dtype=float)
+
+
 def format_volume(v):
     """Format volume in Indian convention (K / L / Cr)"""
     try:
@@ -1533,10 +1547,11 @@ def format_volume(v):
 
 
 # ---------------------------------------------------------------------------
-# Batch data fetching
+# Batch intraday data fetching (fast + rate-limit friendly)
 # ---------------------------------------------------------------------------
-def _batch_download(tickers_tuple, interval, period):
-    """Shared batch downloader returning {ticker: DataFrame}"""
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday_batch(tickers_tuple, interval, period):
+    """Batch download intraday OHLCV for many tickers at once. Cached for 5 minutes."""
     tickers = list(tickers_tuple)
     out = {}
     if not tickers:
@@ -1578,787 +1593,258 @@ def _batch_download(tickers_tuple, interval, period):
 
 
 # ---------------------------------------------------------------------------
-# EARNINGS CALENDAR + VALUE + 52-WEEK HIGH ENGINE
+# Feature engineering for a single stock on a lower timeframe
 # ---------------------------------------------------------------------------
-# Three criteria only:
-#
-#   1. Price is approaching its 52-week high
-#   2. Price is below fair value (undervalued)
-#   3. Earnings fall inside a chosen window - either due in the next N days,
-#      or already reported in the last N days
-#
-# No breakout structure, no momentum indicators, no timeframe scanning.
-# ---------------------------------------------------------------------------
-
-EARNINGS_MODES = {
-    "Reported in last N days (post-earnings drift)": "reported",
-    "Due in next N days (pre-earnings run-up)": "upcoming",
-    "Either side of earnings": "either",
-    "No earnings filter": "off",
-}
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_daily_history_batch(tickers_tuple, period="1y"):
-    """Daily OHLCV for the 52-week high calculation. Cached 15 minutes."""
-    return _batch_download(tickers_tuple, "1d", period)
-
-
-# ---------------------------------------------------------------------------
-# PEER-AVERAGE INDUSTRY P/E
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def compute_peer_industry_pe(industry, max_sample=60, pe_cap=200.0):
-    """
-    Mean trailing P/E of the stocks actually in this industry.
-
-    Stocks with no P/E are excluded, not treated as zero. A missing P/E on
-    Yahoo almost always means negative or nil earnings, and averaging those
-    in as zeros would drag every fair value down.
-
-    Also excluded: non-positive P/E (loss-making, where the ratio carries no
-    valuation meaning) and anything above `pe_cap`, since one 900x outlier
-    moves the mean of a 20-stock industry by 45 points on its own.
-    """
-    result = {'mean': None, 'median': None, 'n': 0, 'excluded_missing': 0,
-              'excluded_negative': 0, 'excluded_outlier': 0, 'values': [],
-              'sample_size': 0}
+def compute_intraday_features(df, orb_bars=4, donchian_len=20, vol_ma_len=20):
+    """Compute all breakout-relevant features from an intraday OHLCV frame"""
     try:
-        stocks = get_stocks_by_category(industry)
-        if not stocks:
-            return result
-
-        tickers = list(stocks.keys())[:max_sample]
-        result['sample_size'] = len(tickers)
-        values = []
-
-        for ticker in tickers:
-            try:
-                f = get_stock_fundamentals(ticker)
-            except Exception:
-                f = None
-            if not f:
-                result['excluded_missing'] += 1
-                continue
-            pe = f.get('trailing_pe')
-            if pe is None or (isinstance(pe, float) and pd.isna(pe)):
-                result['excluded_missing'] += 1
-                continue
-            pe = float(pe)
-            if pe <= 0:
-                result['excluded_negative'] += 1
-                continue
-            if pe > pe_cap:
-                result['excluded_outlier'] += 1
-                continue
-            values.append(pe)
-
-        if values:
-            result['values'] = sorted(values)
-            result['n'] = len(values)
-            result['mean'] = float(np.mean(values))
-            result['median'] = float(np.median(values))
-    except Exception:
-        pass
-    return result
-
-
-# ---------------------------------------------------------------------------
-# EARNINGS DATES - MULTI-SOURCE FALLBACK CHAIN
-# ---------------------------------------------------------------------------
-# Yahoo has no earnings dates for large parts of the NSE mid and small cap
-# universe. Each source below is tried in turn and the winner is recorded in
-# the 'source' field so you can see how a date was obtained.
-# ---------------------------------------------------------------------------
-
-# SEBI LODR Regulation 33: quarterly results must be filed within 45 days of
-# the quarter end (60 days for the final quarter of the financial year).
-SEBI_FILING_LAG_DAYS = 45
-SEBI_Q4_FILING_LAG_DAYS = 60
-
-
-def _earnings_from_info(ticker):
-    """Source 3: the earnings timestamps buried in the already-cached info dict."""
-    try:
-        info, err = fetch_stock_data(ticker)
-        if err or not info:
-            return None, None
-        nxt = last = None
-        for key in ('earningsTimestamp', 'earningsTimestampStart', 'earningsTimestampEnd'):
-            ts = info.get(key)
-            if not ts:
-                continue
-            try:
-                d = pd.Timestamp(int(ts), unit='s')
-            except Exception:
-                continue
-            now = pd.Timestamp.now()
-            if d > now:
-                nxt = d if nxt is None or d < nxt else nxt
-            else:
-                last = d if last is None or d > last else last
-        return nxt, last
-    except Exception:
-        return None, None
-
-
-def _earnings_from_quarter_end(ticker):
-    """
-    Source 4: infer the announcement from the most recent reported quarter.
-
-    Yahoo exposes the quarter END date even when it has no announcement date.
-    Adding the statutory filing lag gives an approximation - clearly flagged as
-    estimated, never presented as a confirmed date.
-    """
-    try:
-        info, err = fetch_stock_data(ticker)
-        q_end = None
-        if not err and info:
-            ts = info.get('mostRecentQuarter')
-            if ts:
-                try:
-                    q_end = pd.Timestamp(int(ts), unit='s')
-                except Exception:
-                    q_end = None
-
-        if q_end is None:
-            tk = yf.Ticker(ticker)
-            for attr in ('quarterly_income_stmt', 'quarterly_financials'):
-                try:
-                    qdf = getattr(tk, attr)
-                    if qdf is not None and not qdf.empty:
-                        cols = [pd.Timestamp(c) for c in qdf.columns]
-                        q_end = max(cols)
-                        break
-                except Exception:
-                    continue
-
-        if q_end is None:
-            return None, None, None
-
-        # Q4 (financial year ending March in India) gets the longer window
-        lag = SEBI_Q4_FILING_LAG_DAYS if q_end.month == 3 else SEBI_FILING_LAG_DAYS
-        deadline = q_end + pd.Timedelta(days=lag)
-        now = pd.Timestamp.now()
-
-        # The filing deadline for the most recent quarter end may not have
-        # arrived yet. In that case it is the NEXT expected announcement, and
-        # the last one belongs to the quarter before it - otherwise a stock
-        # reports a "last earnings" date that has not happened.
-        if deadline > now:
-            est_next = deadline
-            prev_q_end = q_end - pd.Timedelta(days=91)
-            prev_lag = SEBI_Q4_FILING_LAG_DAYS if prev_q_end.month == 3 else SEBI_FILING_LAG_DAYS
-            est_last = prev_q_end + pd.Timedelta(days=prev_lag)
-            if est_last > now:
-                est_last = None
-        else:
-            est_last = deadline
-            next_q_end = q_end + pd.Timedelta(days=91)
-            next_lag = SEBI_Q4_FILING_LAG_DAYS if next_q_end.month == 3 else SEBI_FILING_LAG_DAYS
-            est_next = next_q_end + pd.Timedelta(days=next_lag)
-
-        return est_next, est_last, q_end
-    except Exception:
-        return None, None, None
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def _earnings_from_nse(symbol):
-    """
-    Source 5: NSE India board-meeting calendar. OFF by default.
-
-    NSE requires a cookie handshake and blocks most datacentre IP ranges, so
-    this frequently fails from Streamlit Cloud and other hosted environments.
-    It is opt-in for that reason, and every failure is silent.
-    """
-    try:
-        import requests
-    except Exception:
-        return None, None
-
-    base = "https://www.nseindia.com"
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"{base}/get-quotes/equity?symbol={symbol}",
-    }
-    try:
-        sess = requests.Session()
-        sess.headers.update(headers)
-        sess.get(base, timeout=6)                      # cookie handshake
-        sess.get(f"{base}/get-quotes/equity?symbol={symbol}", timeout=6)
-
-        for url in (f"{base}/api/top-corp-info?symbol={symbol}&market=equities",
-                    f"{base}/api/quote-equity?symbol={symbol}&section=corp_info"):
-            try:
-                r = sess.get(url, timeout=8)
-                if r.status_code != 200:
-                    continue
-                payload = r.json()
-            except Exception:
-                continue
-
-            meetings = []
-            def walk(node):
-                if isinstance(node, dict):
-                    if any(k in node for k in ('meetingdate', 'bm_date', 'meetingDate')):
-                        meetings.append(node)
-                    for v in node.values():
-                        walk(v)
-                elif isinstance(node, list):
-                    for v in node:
-                        walk(v)
-            walk(payload)
-
-            dates = []
-            for m in meetings:
-                purpose = " ".join(str(v) for v in m.values()).lower()
-                if 'result' not in purpose and 'financial' not in purpose:
-                    continue
-                raw = m.get('meetingdate') or m.get('bm_date') or m.get('meetingDate')
-                if not raw:
-                    continue
-                for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"):
-                    try:
-                        dates.append(pd.Timestamp(datetime.strptime(str(raw).strip(), fmt)))
-                        break
-                    except Exception:
-                        continue
-
-            if dates:
-                now = pd.Timestamp.now()
-                future = [d for d in dates if d > now]
-                past = [d for d in dates if d <= now]
-                return (min(future) if future else None), (max(past) if past else None)
-    except Exception:
-        pass
-    return None, None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_earnings_calendar(ticker, allow_nse=False, allow_estimate=True):
-    """
-    Next and most recent earnings dates, trying every available source.
-
-    Source order, best first:
-      1. Yahoo earnings_dates    - confirmed announcement dates
-      2. Yahoo calendar          - confirmed next date
-      3. Yahoo info timestamps   - free, already cached with the info dict
-      4. NSE board meetings      - opt-in, often blocked from cloud hosts
-      5. Quarter-end + SEBI lag  - ESTIMATE, flagged as such
-    """
-    out = {'next_date': None, 'days_to_next': None, 'last_date': None,
-           'days_since_last': None, 'surprise_pct': None,
-           'source': 'None', 'estimated': False}
-
-    # ---- 1. Yahoo earnings_dates ----
-    try:
-        tk = yf.Ticker(ticker)
-        try:
-            df = tk.get_earnings_dates(limit=16)
-        except Exception:
-            df = None
-
-        if df is not None and not df.empty:
-            idx = pd.to_datetime(df.index)
-            tz = getattr(idx, 'tz', None)
-            now = pd.Timestamp.now(tz=tz) if tz is not None else pd.Timestamp.now()
-
-            surprise_col = next((c for c in df.columns if 'surprise' in str(c).lower()), None)
-            reported_col = next((c for c in df.columns if 'reported' in str(c).lower()), None)
-
-            future = [d for d in idx if d > now]
-            past = [d for d in idx if d <= now]
-
-            if future:
-                nxt = min(future)
-                out['next_date'] = nxt
-                out['days_to_next'] = int((nxt - now).days)
-            if past:
-                last = max(past)
-                if reported_col is not None and reported_col in df.columns:
-                    reported = [d for d in past if pd.notna(df.loc[d, reported_col])]
-                    if reported:
-                        last = max(reported)
-                out['last_date'] = last
-                out['days_since_last'] = int((now - last).days)
-                if surprise_col is not None and surprise_col in df.columns:
-                    val = df.loc[last, surprise_col]
-                    if pd.notna(val):
-                        out['surprise_pct'] = float(val)
-            if out['next_date'] is not None or out['last_date'] is not None:
-                out['source'] = 'Yahoo earnings'
-    except Exception:
-        pass
-
-    # ---- 2. Yahoo calendar (next date only) ----
-    if out['next_date'] is None:
-        try:
-            cal = yf.Ticker(ticker).calendar
-            dates = None
-            if isinstance(cal, dict):
-                dates = cal.get('Earnings Date')
-            elif cal is not None and hasattr(cal, 'index') and 'Earnings Date' in cal.index:
-                dates = cal.loc['Earnings Date'].tolist()
-            if dates:
-                if not isinstance(dates, (list, tuple)):
-                    dates = [dates]
-                nxt = pd.Timestamp(min(dates))
-                now = pd.Timestamp.now()
-                if nxt > now:
-                    out['next_date'] = nxt
-                    out['days_to_next'] = int((nxt - now).days)
-                    if out['source'] == 'None':
-                        out['source'] = 'Yahoo calendar'
-        except Exception:
-            pass
-
-    # ---- 3. Yahoo info timestamps ----
-    if out['next_date'] is None or out['last_date'] is None:
-        nxt, last = _earnings_from_info(ticker)
-        now = pd.Timestamp.now()
-        if out['next_date'] is None and nxt is not None:
-            out['next_date'] = nxt
-            out['days_to_next'] = int((nxt - now).days)
-            if out['source'] == 'None':
-                out['source'] = 'Yahoo info'
-        if out['last_date'] is None and last is not None:
-            out['last_date'] = last
-            out['days_since_last'] = int((now - last).days)
-            if out['source'] == 'None':
-                out['source'] = 'Yahoo info'
-
-    # ---- 4. NSE board meetings (opt-in) ----
-    if allow_nse and (out['next_date'] is None or out['last_date'] is None):
-        sym = ticker.replace('.NS', '').replace('.BO', '')
-        nxt, last = _earnings_from_nse(sym)
-        now = pd.Timestamp.now()
-        if out['next_date'] is None and nxt is not None:
-            out['next_date'] = nxt
-            out['days_to_next'] = int((nxt - now).days)
-            out['source'] = 'NSE'
-        if out['last_date'] is None and last is not None:
-            out['last_date'] = last
-            out['days_since_last'] = int((now - last).days)
-            if out['source'] in ('None',):
-                out['source'] = 'NSE'
-
-    # ---- 5. Quarter end + statutory filing lag (ESTIMATE) ----
-    if allow_estimate and (out['next_date'] is None or out['last_date'] is None):
-        est_next, est_last, q_end = _earnings_from_quarter_end(ticker)
-        now = pd.Timestamp.now()
-        if out['last_date'] is None and est_last is not None:
-            out['last_date'] = est_last
-            out['days_since_last'] = int((now - est_last).days)
-            out['estimated'] = True
-            out['source'] = f"≈ Q-end {q_end.strftime('%b-%Y')}" if q_end is not None else "≈ Estimated"
-        if out['next_date'] is None and est_next is not None and est_next > now:
-            out['next_date'] = est_next
-            out['days_to_next'] = int((est_next - now).days)
-            out['estimated'] = True
-            if out['source'] == 'None':
-                out['source'] = "≈ Estimated"
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# MANUAL FAIR VALUE CALCULATOR
-# ---------------------------------------------------------------------------
-def render_manual_fair_value(results_key, key_prefix="mfv"):
-    """
-    Override the model's fair value for any row in the results table.
-
-    The model blends a P/E and a P/B estimate off industry benchmarks. When
-    those inputs are stale or distorted - a trailing EPS from a bad quarter,
-    a book value that has since been written down - this lets you substitute
-    your own numbers and push the result straight back into the table.
-    """
-    df = st.session_state.get(results_key)
-    if df is None or getattr(df, 'empty', True) or 'Ticker' not in df.columns:
-        return
-
-    with st.expander("🧮 Manual Fair Value Calculator"):
-        options = [f"{r['Ticker']} — {r.get('Name', '')}" for _, r in df.iterrows()]
-        picked = st.selectbox("Stock", options, key=f"{key_prefix}_pick")
-        ticker = picked.split(" — ")[0].strip()
-
-        row = df[df['Ticker'] == ticker]
-        if row.empty:
-            return
-        row = row.iloc[0]
-
-        fundamentals = None
-        try:
-            fundamentals = get_stock_fundamentals(ticker)
-        except Exception:
-            pass
-
-        ltp = float(row['LTP']) if pd.notna(row.get('LTP')) else 0.0
-        eps_default = float(fundamentals.get('trailing_eps') or 0.0) if fundamentals else 0.0
-        bv_default = float(fundamentals.get('book_value') or 0.0) if fundamentals else 0.0
-        pe_default = float(fundamentals.get('trailing_pe') or 0.0) if fundamentals else 0.0
-
-        industry = None
-        try:
-            si = get_stock_info(ticker)
-            industry = si['category'] if si else (fundamentals.get('industry') if fundamentals else None)
-        except Exception:
-            pass
-        bench = {}
-        try:
-            bench = get_industry_benchmarks(industry or 'Other',
-                                            (fundamentals or {}).get('cap_type', 'Large'))
-        except Exception:
-            bench = {}
-
-        st.caption(f"**{ticker}** · LTP ₹{ltp:,.2f} · Industry: {industry or 'Unknown'} · "
-                   f"Current P/E {pe_default:,.2f} · Model fair value "
-                   f"{'₹{:,.2f}'.format(row['Fair Value']) if pd.notna(row.get('Fair Value')) else 'N/A'}")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            eps = st.number_input("EPS (₹)", value=float(round(eps_default, 2)),
-                                  step=0.5, format="%.2f", key=f"{key_prefix}_eps")
-            target_pe = st.number_input("Target P/E", value=float(round(bench.get('pe', 18.0), 2)),
-                                        min_value=0.0, step=0.5, format="%.2f",
-                                        key=f"{key_prefix}_pe")
-        with c2:
-            bv = st.number_input("Book Value / share (₹)", value=float(round(bv_default, 2)),
-                                 step=1.0, format="%.2f", key=f"{key_prefix}_bv")
-            target_pb = st.number_input("Target P/B", value=float(round(bench.get('pb', 2.5), 2)),
-                                        min_value=0.0, step=0.1, format="%.2f",
-                                        key=f"{key_prefix}_pb")
-        with c3:
-            pe_weight = st.slider("Weight on P/E method", 0, 100, 70, 5,
-                                  key=f"{key_prefix}_w") / 100.0
-            margin = st.slider("Margin of safety %", 0, 50, 0, 5,
-                               key=f"{key_prefix}_mos",
-                               help="Discounts the computed fair value before "
-                                    "the upside is calculated.")
-
-        pe_fv = eps * target_pe if eps and target_pe else None
-        pb_fv = bv * target_pb if bv and target_pb else None
-
-        if pe_fv is not None and pb_fv is not None:
-            fv = pe_weight * pe_fv + (1 - pe_weight) * pb_fv
-        else:
-            fv = pe_fv if pe_fv is not None else pb_fv
-
-        if fv is not None and fv > 0:
-            fv = fv * (1 - margin / 100.0)
-            upside = ((fv - ltp) / ltp * 100) if ltp else None
-
-            r1, r2, r3 = st.columns(3)
-            r1.metric("P/E fair value", f"₹{pe_fv:,.2f}" if pe_fv else "N/A")
-            r2.metric("P/B fair value", f"₹{pb_fv:,.2f}" if pb_fv else "N/A")
-            r3.metric("Blended fair value", f"₹{fv:,.2f}",
-                      delta=f"{upside:+.1f}% vs LTP" if upside is not None else None)
-
-            b1, b2 = st.columns(2)
-            with b1:
-                if st.button("✅ Apply to results table", key=f"{key_prefix}_apply",
-                             use_container_width=True, type="primary"):
-                    d = st.session_state[results_key].copy()
-                    mask = d['Ticker'] == ticker
-                    d.loc[mask, 'Fair Value'] = fv
-                    d.loc[mask, 'Upside %'] = upside
-                    d.loc[mask, 'Value Tag'] = get_valuation_tag(upside)
-                    if 'FV Source' in d.columns:
-                        d.loc[mask, 'FV Source'] = '🧮 Manual'
-                    st.session_state[results_key] = d
-                    st.rerun()
-            with b2:
-                if st.button("↩️ Revert this row to model", key=f"{key_prefix}_revert",
-                             use_container_width=True):
-                    d = st.session_state[results_key].copy()
-                    mask = d['Ticker'] == ticker
-                    try:
-                        f2 = get_stock_fundamentals(ticker)
-                        fv2 = calculate_fair_value(f2, industry or 'Other',
-                                                   f2.get('cap_type', 'Large'))
-                        up2 = ((fv2 - f2['price']) / f2['price'] * 100) if fv2 else None
-                        d.loc[mask, 'Fair Value'] = fv2
-                        d.loc[mask, 'Upside %'] = up2
-                        d.loc[mask, 'Value Tag'] = get_valuation_tag(up2)
-                        if 'FV Source' in d.columns:
-                            d.loc[mask, 'FV Source'] = 'Model'
-                        st.session_state[results_key] = d
-                        st.rerun()
-                    except Exception:
-                        st.warning("Could not recompute the model value for this stock.")
-        else:
-            st.info("Enter an EPS with a target P/E, or a book value with a target P/B.")
-
-
-def compute_52w_features(df):
-    """Price position against the 52-week high, plus volume context."""
-    try:
-        if df is None or len(df) < 60:
-            return None
-        d = df[['High', 'Low', 'Close', 'Volume']].dropna(subset=['Close'])
-        if len(d) < 60:
+        if df is None or len(df) < 40:
             return None
 
-        window = d.iloc[-252:] if len(d) >= 252 else d
-        high_52w = float(window['High'].max())
-        low_52w = float(window['Low'].min())
-        price = float(d['Close'].iloc[-1])
-        if high_52w <= 0 or price <= 0:
+        d = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        d = d.dropna(subset=['Close', 'High', 'Low'])
+        if len(d) < 40:
             return None
 
+        close, high, low = d['Close'], d['High'], d['Low']
         volume = d['Volume'].fillna(0)
-        last_vol = float(volume.iloc[-1])
-        avg_vol = float(volume.rolling(20).mean().iloc[-1]) if len(volume) >= 20 else last_vol
-        prev_close = float(d['Close'].iloc[-2]) if len(d) > 1 else price
 
-        # Negative = below the high. -2.0 means 2% under the 52-week high.
-        pct_from_high = (price - high_52w) / high_52w * 100
+        vwap = calculate_session_vwap(d)
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        rsi = calculate_rsi(close, 14)
+        atr = calculate_atr_series(high, low, close, 14)
+        vol_ma = volume.rolling(vol_ma_len).mean()
 
-        return {
-            'price': price,
-            'high_52w': high_52w,
-            'low_52w': low_52w,
-            'pct_from_high': pct_from_high,
-            'pct_from_low': (price - low_52w) / low_52w * 100 if low_52w > 0 else None,
+        # Bollinger width for squeeze / consolidation detection
+        ma20 = close.rolling(20).mean()
+        sd20 = close.rolling(20).std()
+        bbw = ((ma20 + 2 * sd20) - (ma20 - 2 * sd20)) / ma20.replace(0, np.nan) * 100
+
+        # Donchian channel of PRIOR n bars (shifted so current bar is excluded)
+        don_high = high.rolling(donchian_len).max().shift(1)
+        don_low = low.rolling(donchian_len).min().shift(1)
+
+        # Session segmentation
+        session_key = pd.Series(pd.to_datetime(d.index).date, index=d.index)
+        sessions = list(dict.fromkeys(session_key.tolist()))
+        last_session = sessions[-1]
+        cur = d[session_key == last_session]
+
+        prev_day_high = prev_day_low = prev_day_close = None
+        if len(sessions) >= 2:
+            prev = d[session_key == sessions[-2]]
+            if not prev.empty:
+                prev_day_high = float(prev['High'].max())
+                prev_day_low = float(prev['Low'].min())
+                prev_day_close = float(prev['Close'].iloc[-1])
+
+        # Opening range
+        orb_high = orb_low = None
+        orb_valid = False
+        if len(cur) >= 1:
+            n_or = min(orb_bars, len(cur))
+            orb_high = float(cur['High'].iloc[:n_or].max())
+            orb_low = float(cur['Low'].iloc[:n_or].min())
+            orb_valid = len(cur) > orb_bars
+
+        i = -1
+        last_close = float(close.iloc[i])
+        last_open = float(d['Open'].iloc[i])
+        last_high = float(high.iloc[i])
+        last_low = float(low.iloc[i])
+        last_vol = float(volume.iloc[i]) if not pd.isna(volume.iloc[i]) else 0.0
+        avg_vol = float(vol_ma.iloc[i]) if not pd.isna(vol_ma.iloc[i]) else 0.0
+        last_vwap = float(vwap.iloc[i]) if not pd.isna(vwap.iloc[i]) else None
+        prev_vwap = float(vwap.iloc[i - 1]) if len(vwap) > 1 and not pd.isna(vwap.iloc[i - 1]) else None
+        prev_close = float(close.iloc[i - 1])
+        last_atr = float(atr.iloc[i]) if not pd.isna(atr.iloc[i]) else 0.0
+        bar_range = max(last_high - last_low, 1e-9)
+
+        # Squeeze: was the BB width recently in the bottom quartile of the last 100 bars?
+        squeeze_release = False
+        try:
+            bbw_hist = bbw.dropna().iloc[-100:]
+            if len(bbw_hist) >= 30:
+                q25 = float(np.nanpercentile(bbw_hist, 25))
+                squeeze_release = bool((bbw_hist.iloc[-10:-1] <= q25).any())
+        except Exception:
+            squeeze_release = False
+
+        feat = {
+            'price': last_close,
+            'open': last_open,
+            'high': last_high,
+            'low': last_low,
+            'prev_close': prev_close,
             'last_volume': last_vol,
             'avg_volume': avg_vol,
             'rel_volume': (last_vol / avg_vol) if avg_vol > 0 else 0.0,
-            'chg_pct': (price - prev_close) / prev_close * 100 if prev_close else 0.0,
-            'last_bar': d.index[-1],
+            'session_volume': float(cur['Volume'].fillna(0).sum()) if not cur.empty else 0.0,
+            'vwap': last_vwap,
+            'prev_vwap': prev_vwap,
+            'prev_bar_close': prev_close,
+            'ema20': float(ema20.iloc[i]),
+            'ema50': float(ema50.iloc[i]),
+            'rsi': float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else 50.0,
+            'atr': last_atr,
+            'atr_pct': (last_atr / last_close * 100) if last_close else 0.0,
+            'bar_range': bar_range,
+            'don_high': float(don_high.iloc[i]) if not pd.isna(don_high.iloc[i]) else None,
+            'don_low': float(don_low.iloc[i]) if not pd.isna(don_low.iloc[i]) else None,
+            'don_high_prev': float(don_high.iloc[i - 1]) if not pd.isna(don_high.iloc[i - 1]) else None,
+            'don_low_prev': float(don_low.iloc[i - 1]) if not pd.isna(don_low.iloc[i - 1]) else None,
+            'orb_high': orb_high,
+            'orb_low': orb_low,
+            'orb_valid': orb_valid,
+            'prev_day_high': prev_day_high,
+            'prev_day_low': prev_day_low,
+            'prev_day_close': prev_day_close,
+            'squeeze_release': squeeze_release,
+            'closing_strength': (last_close - last_low) / bar_range,
+            'day_change_pct': ((last_close - prev_day_close) / prev_day_close * 100) if prev_day_close else 0.0,
+            'last_bar_time': d.index[i],
         }
+        return feat
     except Exception:
         return None
 
 
-def earnings_window_passes(cal, mode, upcoming_days, reported_days):
-    """Apply the chosen earnings-window rule. Returns (passes, status_label)."""
-    d_next = cal.get('days_to_next')
-    d_last = cal.get('days_since_last')
+# ---------------------------------------------------------------------------
+# Breakout criteria evaluation + scoring
+# ---------------------------------------------------------------------------
+BREAKOUT_CRITERIA_LABELS = {
+    'donchian_break': "N-Bar Range Breakout",
+    'volume_surge': "Volume Surge (Rel Vol)",
+    'vwap_side': "Price vs VWAP",
+    'vwap_reclaim': "Fresh VWAP Cross",
+    'ema_stack': "EMA 20/50 Trend Stack",
+    'rsi_zone': "RSI Momentum Zone",
+    'atr_expansion': "ATR Range Expansion",
+    'orb_break': "Opening Range Breakout",
+    'prev_day_break': "Previous Day High/Low Break",
+    'squeeze_release': "Volatility Squeeze Release",
+    'closing_strength': "Strong Candle Close",
+}
 
-    upcoming = d_next is not None and 0 <= d_next <= upcoming_days
-    reported = d_last is not None and 0 <= d_last <= reported_days
-
-    if mode == "off":
-        # No window applies here, so report the real dates rather than
-        # pretending a stock 45 days from earnings has no date at all.
-        if d_next is not None and d_last is not None:
-            return True, (f"🔜 In {d_next}d" if d_next <= d_last else f"✅ {d_last}d ago")
-        if d_next is not None:
-            return True, f"🔜 In {d_next}d"
-        if d_last is not None:
-            return True, f"✅ {d_last}d ago"
-        return True, "— No date"
-
-    if mode == "upcoming":
-        return upcoming, (f"🔜 In {d_next}d" if upcoming else "")
-
-    if mode == "reported":
-        return reported, (f"✅ {d_last}d ago" if reported else "")
-
-    # either
-    if upcoming and reported:
-        return True, f"🔁 {d_last}d ago → {d_next}d"
-    if upcoming:
-        return True, f"🔜 In {d_next}d"
-    if reported:
-        return True, f"✅ {d_last}d ago"
-    return False, ""
+BREAKOUT_CRITERIA_WEIGHTS = {
+    'donchian_break': 20,
+    'volume_surge': 15,
+    'vwap_side': 10,
+    'vwap_reclaim': 5,
+    'ema_stack': 10,
+    'rsi_zone': 8,
+    'atr_expansion': 7,
+    'orb_break': 8,
+    'prev_day_break': 7,
+    'squeeze_release': 5,
+    'closing_strength': 5,
+}
 
 
-def run_earnings_value_screener(universe, near_high_pct=5.0, min_upside=15.0,
-                                earnings_mode="reported", upcoming_days=30,
-                                reported_days=30, min_price=20.0,
-                                min_avg_volume=50000, max_results=40,
-                                max_valuation_calls=150, chunk_size=25,
-                                final_rank="Upside %", allow_nse=False,
-                                allow_estimate=True):
-    """
-    Three-stage funnel, ordered cheapest first.
+def evaluate_breakout(feat, direction="Bullish Breakout", rel_vol_threshold=1.5,
+                      required_criteria=None, atr_mult=1.2):
+    """Evaluate all breakout criteria and return a scored dict, or None if gates fail"""
+    if not feat:
+        return None
 
-      1. Daily bars, batched  - 52-week high proximity, price, liquidity
-      2. Fair value           - per ticker, cached, only on stage-1 survivors
-      3. Earnings calendar    - per ticker, cached, only on stage-2 survivors
+    bullish = direction.startswith("Bullish")
+    checks = {}
 
-    Stages 2 and 3 are per-ticker calls, so the ordering matters: stage 1
-    typically removes 90% of a universe for the cost of a handful of requests.
-    """
-    tickers = list(universe.keys())
-    total = len(tickers)
-    funnel = {'scanned': 0, 'with_data': 0, 'near_high': 0,
-              'undervalued': 0, 'earnings_ok': 0, 'final': 0}
+    price = feat['price']
+    vwap = feat['vwap']
 
-    if total == 0:
-        return pd.DataFrame(), funnel
-
-    # ---------------- STAGE 1: 52-week high proximity ----------------
-    stage1 = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    processed = 0
-
-    for start in range(0, total, chunk_size):
-        chunk = tickers[start:start + chunk_size]
-        status_text.text(f"📈 Stage 1/3 — 52-week high scan... "
-                         f"{processed}/{total} | near high: {len(stage1)}")
-        data_map = fetch_daily_history_batch(tuple(chunk), "1y")
-
-        for ticker in chunk:
-            processed += 1
-            funnel['scanned'] += 1
-            try:
-                progress_bar.progress(min(processed / total * 0.5, 0.5))
-            except Exception:
-                pass
-
-            df = data_map.get(ticker)
-            if df is None or df.empty:
-                continue
-            funnel['with_data'] += 1
-
-            feat = compute_52w_features(df)
-            if not feat:
-                continue
-            if feat['price'] < min_price or feat['avg_volume'] < min_avg_volume:
-                continue
-            # pct_from_high is negative below the high; -near_high_pct is the floor
-            if feat['pct_from_high'] < -abs(near_high_pct):
-                continue
-
-            funnel['near_high'] += 1
-            stage1.append({'ticker': ticker, 'feat': feat})
-
-    # Closest to the high first, then cap the per-ticker work that follows
-    stage1.sort(key=lambda c: c['feat']['pct_from_high'], reverse=True)
-    stage1 = stage1[:max_valuation_calls]
-
-    # ---------------- STAGE 2: valuation ----------------
-    rows = []
-    for n, c in enumerate(stage1):
-        ticker, feat = c['ticker'], c['feat']
-        try:
-            progress_bar.progress(min(0.5 + (n + 1) / max(len(stage1), 1) * 0.3, 0.8))
-            status_text.text(f"💰 Stage 2/3 — valuing... {n + 1}/{len(stage1)} — {ticker}")
-        except Exception:
-            pass
-
-        fair_value = upside = pe_ratio = cap_type = market_cap = None
-        try:
-            fundamentals = get_stock_fundamentals(ticker)
-            if fundamentals and fundamentals.get('price'):
-                stock_info = get_stock_info(ticker)
-                industry = stock_info['category'] if stock_info else fundamentals.get('industry', 'Other')
-                cap_type = fundamentals.get('cap_type', 'Large')
-                pe_ratio = fundamentals.get('trailing_pe')
-                market_cap = fundamentals.get('market_cap')
-                fv = calculate_fair_value(fundamentals, industry, cap_type)
-                if fv and fv > 0:
-                    ref = fundamentals['price']
-                    up = ((fv - ref) / ref) * 100
-                    if -95 <= up <= 350:
-                        fair_value, upside = fv, up
-        except Exception:
-            pass
-
-        if upside is None or upside < min_upside:
-            continue
-        funnel['undervalued'] += 1
-
-        rows.append({
-            'ticker': ticker, 'feat': feat, 'fair_value': fair_value,
-            'upside': upside, 'pe_ratio': pe_ratio, 'cap_type': cap_type,
-            'market_cap': market_cap
-        })
-
-    # ---------------- STAGE 3: earnings calendar ----------------
-    final_rows = []
-    for n, r in enumerate(rows):
-        ticker, feat = r['ticker'], r['feat']
-        try:
-            progress_bar.progress(min(0.8 + (n + 1) / max(len(rows), 1) * 0.2, 1.0))
-            status_text.text(f"📅 Stage 3/3 — earnings dates... {n + 1}/{len(rows)} — {ticker}")
-        except Exception:
-            pass
-
-        cal = fetch_earnings_calendar(ticker, allow_nse=allow_nse,
-                                      allow_estimate=allow_estimate)
-        passes, status = earnings_window_passes(cal, earnings_mode,
-                                                upcoming_days, reported_days)
-        if not passes:
-            continue
-        funnel['earnings_ok'] += 1
-
-        surprise = cal.get('surprise_pct')
-        if surprise is None:
-            surprise_tag = "—"
-        elif surprise > 0:
-            surprise_tag = f"🟢 Beat {surprise:+.1f}%"
-        elif surprise < 0:
-            surprise_tag = f"🔴 Miss {surprise:+.1f}%"
-        else:
-            surprise_tag = "⚪ In line"
-
-        final_rows.append({
-            'Ticker': ticker,
-            'Name': universe.get(ticker, ticker),
-            'LTP': feat['price'],
-            'Chg %': feat['chg_pct'],
-            '52W High': feat['high_52w'],
-            'From High %': feat['pct_from_high'],
-            'Fair Value': r['fair_value'],
-            'Upside %': r['upside'],
-            'Value Tag': get_valuation_tag(r['upside']),
-            'FV Source': 'Model',
-            'Earnings': status,
-            'Date Source': cal.get('source', 'None'),
-            'Estimated': bool(cal.get('estimated')),
-            'Next Earnings': cal['next_date'].strftime('%d-%b-%Y') if cal.get('next_date') is not None else 'N/A',
-            'Days To': cal.get('days_to_next'),
-            'Last Earnings': cal['last_date'].strftime('%d-%b-%Y') if cal.get('last_date') is not None else 'N/A',
-            'Days Since': cal.get('days_since_last'),
-            'Last Surprise': surprise_tag,
-            'Surprise %': surprise,
-            'Volume': feat['last_volume'],
-            'Avg Volume': feat['avg_volume'],
-            'Rel Vol': feat['rel_volume'],
-            'From Low %': feat['pct_from_low'],
-            'PE Ratio': r['pe_ratio'],
-            'Cap Type': r['cap_type'],
-            'Market Cap': r['market_cap'],
-            'As Of': feat['last_bar'].strftime('%d-%b-%Y') if hasattr(feat['last_bar'], 'strftime') else str(feat['last_bar']),
-            'Valuation': build_valuation_link(ticker),
-        })
-
-    try:
-        progress_bar.empty()
-        status_text.empty()
-    except Exception:
-        pass
-
-    if not final_rows:
-        return pd.DataFrame(), funnel
-
-    df_out = pd.DataFrame(final_rows)
-
-    if final_rank == "Closest to 52W High":
-        df_out = df_out.sort_values('From High %', ascending=False)
-    elif final_rank == "Earnings Soonest":
-        df_out = df_out.sort_values('Days To', ascending=True, na_position='last')
-    elif final_rank == "Best Surprise":
-        df_out = df_out.sort_values('Surprise %', ascending=False, na_position='last')
+    # 1. Donchian / N-bar range breakout
+    if bullish:
+        level = feat.get('don_high')
+        checks['donchian_break'] = bool(level and price > level)
     else:
-        df_out = df_out.sort_values('Upside %', ascending=False)
+        level = feat.get('don_low')
+        checks['donchian_break'] = bool(level and price < level)
 
-    df_out = df_out.head(max_results).reset_index(drop=True)
-    funnel['final'] = len(df_out)
-    return df_out, funnel
+    # 2. Volume surge
+    checks['volume_surge'] = bool(feat['rel_volume'] >= rel_vol_threshold)
+
+    # 3. VWAP side
+    if vwap:
+        checks['vwap_side'] = bool(price > vwap) if bullish else bool(price < vwap)
+    else:
+        checks['vwap_side'] = False
+
+    # 4. Fresh VWAP cross on this bar
+    if vwap and feat.get('prev_vwap'):
+        if bullish:
+            checks['vwap_reclaim'] = bool(feat['prev_bar_close'] <= feat['prev_vwap'] and price > vwap)
+        else:
+            checks['vwap_reclaim'] = bool(feat['prev_bar_close'] >= feat['prev_vwap'] and price < vwap)
+    else:
+        checks['vwap_reclaim'] = False
+
+    # 5. EMA trend stack
+    if bullish:
+        checks['ema_stack'] = bool(price > feat['ema20'] > feat['ema50'])
+    else:
+        checks['ema_stack'] = bool(price < feat['ema20'] < feat['ema50'])
+
+    # 6. RSI momentum zone
+    rsi = feat['rsi']
+    checks['rsi_zone'] = bool(55 <= rsi <= 82) if bullish else bool(18 <= rsi <= 45)
+
+    # 7. ATR range expansion
+    checks['atr_expansion'] = bool(feat['atr'] > 0 and feat['bar_range'] >= atr_mult * feat['atr'])
+
+    # 8. Opening range breakout
+    if feat.get('orb_valid'):
+        if bullish:
+            checks['orb_break'] = bool(feat.get('orb_high') and price > feat['orb_high'])
+        else:
+            checks['orb_break'] = bool(feat.get('orb_low') and price < feat['orb_low'])
+    else:
+        checks['orb_break'] = False
+
+    # 9. Previous day high / low break
+    if bullish:
+        checks['prev_day_break'] = bool(feat.get('prev_day_high') and price > feat['prev_day_high'])
+    else:
+        checks['prev_day_break'] = bool(feat.get('prev_day_low') and price < feat['prev_day_low'])
+
+    # 10. Volatility squeeze release
+    checks['squeeze_release'] = bool(feat.get('squeeze_release'))
+
+    # 11. Candle closing strength
+    cs = feat['closing_strength']
+    checks['closing_strength'] = bool(cs >= 0.60) if bullish else bool(cs <= 0.40)
+
+    # Mandatory gates
+    if required_criteria:
+        for key in required_criteria:
+            if not checks.get(key, False):
+                return None
+
+    score = sum(BREAKOUT_CRITERIA_WEIGHTS[k] for k, v in checks.items() if v)
+    met = [BREAKOUT_CRITERIA_LABELS[k] for k, v in checks.items() if v]
+
+    # Freshness: did the breakout happen on the LATEST bar only?
+    fresh = False
+    if bullish and feat.get('don_high_prev'):
+        fresh = bool(feat['prev_bar_close'] <= feat['don_high_prev'] and checks['donchian_break'])
+    elif (not bullish) and feat.get('don_low_prev'):
+        fresh = bool(feat['prev_bar_close'] >= feat['don_low_prev'] and checks['donchian_break'])
+
+    breakout_level = feat.get('don_high') if bullish else feat.get('don_low')
+
+    return {
+        'checks': checks,
+        'score': score,
+        'criteria_met': ", ".join(met) if met else "None",
+        'criteria_count': len(met),
+        'fresh': fresh,
+        'breakout_level': breakout_level,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Valuation enrichment (fair value + upside %)
+# Valuation enrichment for breakout hits (fair value + upside %)
 # ---------------------------------------------------------------------------
 def get_valuation_tag(upside):
     """Human readable valuation status from the upside percentage"""
@@ -2375,15 +1861,13 @@ def get_valuation_tag(upside):
     return "⚠️ Overvalued"
 
 
-def enrich_with_valuation(rows, show_progress=True):
+def enrich_breakout_with_valuation(rows, show_progress=True):
     """
-    Attach fair value and upside to breakout candidates.
+    Attach fundamental fair value / upside to the breakout candidates.
 
-    DISPLAY ONLY. Nothing here can remove a stock from the results - the
-    screener is purely technical, and these columns exist so you can see what
-    you are buying, not to veto a valid setup. Runs after the technical and
-    trend gates, so the per-ticker calls only touch survivors, and
-    fetch_stock_data() is cached for an hour.
+    Runs ONLY on the stocks that already passed the technical screen, so the
+    extra yfinance calls stay small. fetch_stock_data() is cached for 1 hour,
+    so repeat scans in the same session are instant.
     """
     if not rows:
         return rows
@@ -2397,15 +1881,20 @@ def enrich_with_valuation(rows, show_progress=True):
         if show_progress:
             try:
                 progress_bar.progress(min((n + 1) / total, 1.0))
-                status_text.text(f"💰 Fetching fair value... {n + 1}/{total} — {ticker}")
+                status_text.text(f"💰 Valuing breakout candidates... {n + 1}/{total} — {ticker}")
             except Exception:
                 pass
 
-        fair_value = upside = pe_ratio = market_cap = cap_type = None
+        fair_value = None
+        upside = None
+        pe_ratio = None
+        market_cap = None
+        cap_type = None
 
         try:
             fundamentals = get_stock_fundamentals(ticker)
             if fundamentals and fundamentals.get('price'):
+                # Prefer the curated category from INDIAN_STOCKS, else yfinance industry
                 stock_info = get_stock_info(ticker)
                 industry = stock_info['category'] if stock_info else fundamentals.get('industry', 'Other')
                 cap_type = fundamentals.get('cap_type', 'Large')
@@ -2414,10 +1903,12 @@ def enrich_with_valuation(rows, show_progress=True):
 
                 fv = calculate_fair_value(fundamentals, industry, cap_type)
                 if fv and fv > 0:
-                    ref = fundamentals['price']
-                    up = ((fv - ref) / ref) * 100
+                    ref_price = fundamentals['price']
+                    up = ((fv - ref_price) / ref_price) * 100
+                    # Guard against garbage fundamentals producing absurd numbers
                     if -95 <= up <= 350:
-                        fair_value, upside = fv, up
+                        fair_value = fv
+                        upside = up
         except Exception:
             pass
 
@@ -2439,13 +1930,130 @@ def enrich_with_valuation(rows, show_progress=True):
 
 
 # ---------------------------------------------------------------------------
-# MAIN SCREENER PIPELINE
+# Main lower-timeframe screener
 # ---------------------------------------------------------------------------
+def run_breakout_screener(universe, timeframe_label, direction="Bullish Breakout",
+                          rel_vol_threshold=1.5, min_price=10.0, min_avg_volume=25000,
+                          donchian_len=20, min_score=55, required_criteria=None,
+                          max_results=50, chunk_size=25,
+                          include_valuation=True, min_upside=None):
+    """
+    Screen a universe of stocks for intraday breakouts on 15m / 1h timeframes.
+    `universe` is a dict of {ticker: company_name}.
+    """
+    cfg = INTRADAY_TIMEFRAMES.get(timeframe_label, INTRADAY_TIMEFRAMES["15 Minute"])
+    tickers = list(universe.keys())
+    total = len(tickers)
+    if total == 0:
+        return pd.DataFrame()
+
+    results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    processed = 0
+
+    for start in range(0, total, chunk_size):
+        chunk = tickers[start:start + chunk_size]
+        status_text.text(f"⚡ Scanning {cfg['label']} candles... {processed}/{total} | Found: {len(results)}")
+
+        data_map = fetch_intraday_batch(tuple(chunk), cfg['interval'], cfg['period'])
+
+        for ticker in chunk:
+            processed += 1
+            try:
+                progress_bar.progress(min(processed / total, 1.0))
+            except Exception:
+                pass
+
+            df = data_map.get(ticker)
+            if df is None or df.empty:
+                continue
+
+            feat = compute_intraday_features(df, cfg['orb_bars'], donchian_len)
+            if not feat:
+                continue
+
+            # Liquidity / price gates
+            if feat['price'] < min_price:
+                continue
+            if (feat['avg_volume'] or 0) < min_avg_volume:
+                continue
+
+            verdict = evaluate_breakout(feat, direction, rel_vol_threshold, required_criteria)
+            if not verdict or verdict['score'] < min_score:
+                continue
+
+            vwap_dist = ((feat['price'] - feat['vwap']) / feat['vwap'] * 100) if feat.get('vwap') else None
+
+            results.append({
+                'Ticker': ticker,
+                'Name': universe.get(ticker, ticker),
+                'Timeframe': cfg['label'],
+                'LTP': feat['price'],
+                'Fair Value': None,      # filled by enrich_breakout_with_valuation()
+                'Upside %': None,        # filled by enrich_breakout_with_valuation()
+                'Value Tag': None,       # filled by enrich_breakout_with_valuation()
+                'Day Chg %': feat['day_change_pct'],
+                'Score': verdict['score'],
+                'Setup': ("🆕 Fresh Breakout" if verdict['fresh'] else "🔁 Continuation") if direction.startswith("Bullish")
+                         else ("🆕 Fresh Breakdown" if verdict['fresh'] else "🔁 Continuation"),
+                'Breakout Level': verdict['breakout_level'],
+                'Volume': feat['last_volume'],
+                'Avg Volume': feat['avg_volume'],
+                'Rel Vol': feat['rel_volume'],
+                'Session Volume': feat['session_volume'],
+                'VWAP': feat['vwap'],
+                'VWAP Dist %': vwap_dist,
+                'RSI': feat['rsi'],
+                'ATR %': feat['atr_pct'],
+                'EMA20': feat['ema20'],
+                'EMA50': feat['ema50'],
+                'ORB High': feat.get('orb_high'),
+                'ORB Low': feat.get('orb_low'),
+                'Prev Day High': feat.get('prev_day_high'),
+                'Prev Day Low': feat.get('prev_day_low'),
+                'Criteria Met': verdict['criteria_met'],
+                'Criteria Count': verdict['criteria_count'],
+                'Last Candle': feat['last_bar_time'].strftime('%d-%b %H:%M') if hasattr(feat['last_bar_time'], 'strftime') else str(feat['last_bar_time']),
+                'Valuation': build_valuation_link(ticker),
+            })
+
+        if len(results) >= max_results:
+            break
+
+    try:
+        progress_bar.empty()
+        status_text.empty()
+    except Exception:
+        pass
+
+    if not results:
+        return pd.DataFrame()
+
+    # Rank technically first, trim to max_results, THEN value only the survivors
+    results = sorted(results, key=lambda r: (r['Score'], r['Rel Vol']), reverse=True)
+    results = results[:max_results]
+
+    if include_valuation:
+        results = enrich_breakout_with_valuation(results)
+
+    df_out = pd.DataFrame(results)
+
+    # Optional: keep only breakouts that are ALSO undervalued
+    if include_valuation and min_upside is not None and not df_out.empty:
+        df_out = df_out[df_out['Upside %'].notna() & (df_out['Upside %'] >= min_upside)]
+
+    if not df_out.empty:
+        df_out = df_out.sort_values(['Score', 'Rel Vol'], ascending=[False, False])
+        df_out = df_out.reset_index(drop=True)
+    return df_out
+
+
 # ---------------------------------------------------------------------------
 # Deep-link helpers: jump from screener result row -> valuation screen
 # ---------------------------------------------------------------------------
 def build_valuation_link(ticker):
-    """Build a deep link that opens the Individual Analysis (valuation) screen"""
+    """Build a deep link that opens the Individual Analysis (valuation) screen for a ticker"""
     try:
         base = st.session_state.get("app_base_url", "").strip().rstrip("/")
     except Exception:
@@ -2484,8 +2092,7 @@ def render_valuation_jump(results_df, key_prefix):
             label_visibility="collapsed"
         )
     with c2:
-        if st.button("📊 Open Valuation", key=f"{key_prefix}_val_btn",
-                     use_container_width=True, type="primary"):
+        if st.button("📊 Open Valuation", key=f"{key_prefix}_val_btn", use_container_width=True, type="primary"):
             chosen = picked.split(" — ")[0].strip()
             st.session_state["_pending_mode"] = "📈 Individual Analysis"
             st.session_state["input_method_radio"] = "✏️ Direct Ticker"
@@ -2790,7 +2397,7 @@ def main():
     # ------------------------------------------------------------------
     MODE_OPTIONS = [
         "🎯 Industry Screener",
-        "📅 Earnings + Value Screener",
+        "⚡ Breakout Screener (1H / 15M)",
         "📈 Individual Analysis",
         "📊 Industry Explorer"
     ]
@@ -3022,40 +2629,57 @@ def main():
                     use_container_width=True
                 )
     
-    elif mode == "📅 Earnings + Value Screener":
+    elif mode == "⚡ Breakout Screener (1H / 15M)":
         
-        st.markdown("### 📅 Earnings + Value Screener")
-        st.caption("Undervalued stocks trading near their 52-week high, filtered by where "
-                   "they sit in the earnings calendar. No breakout or momentum criteria.")
+        st.markdown("### ⚡ Lower Timeframe Breakout Screener")
+        st.caption("Intraday momentum scanner for 1 Hour and 15 Minute candles — "
+                   "range breakouts, VWAP, volume surge, opening range and squeeze release.")
         
-        # ---------------- Universe ----------------
-        st.sidebar.markdown("### 🌐 Universe")
+        # ---------------- Sidebar controls ----------------
+        st.sidebar.markdown("### ⚡ Breakout Settings")
+        
+        timeframe_label = st.sidebar.selectbox(
+            "⏱️ Timeframe",
+            list(INTRADAY_TIMEFRAMES.keys()),
+            index=0,
+            help="15 Minute = ~30 days of history | 1 Hour = ~90 days of history"
+        )
+        
+        direction = st.sidebar.radio(
+            "📐 Direction",
+            ["Bullish Breakout", "Bearish Breakdown"],
+            horizontal=False
+        )
+        
         universe_mode = st.sidebar.selectbox(
-            "Source", ["Preset Watchlist", "By Industry", "Custom Tickers"]
+            "🌐 Universe",
+            ["Preset Watchlist", "By Industry", "Custom Tickers"]
         )
         
         universe = {}
         universe_label = ""
         
         if universe_mode == "Preset Watchlist":
-            preset = st.sidebar.selectbox("Watchlist", list(BREAKOUT_PRESET_UNIVERSES.keys()))
+            preset = st.sidebar.selectbox("Select Watchlist", list(BREAKOUT_PRESET_UNIVERSES.keys()))
             universe = {t: t.replace('.NS', '').replace('.BO', '') for t in BREAKOUT_PRESET_UNIVERSES[preset]}
             universe_label = preset
         
         elif universe_mode == "By Industry":
-            ev_industries = sorted(get_all_categories())
-            ev_options = [f"{ind} ({len(get_stocks_by_category(ind))} stocks)" for ind in ev_industries]
-            ev_selected = st.sidebar.selectbox("Industry", ev_options)
-            ev_industry = ev_selected.split(" (")[0]
-            universe = dict(get_stocks_by_category(ev_industry))
-            universe_label = ev_industry
-            scan_cap = st.sidebar.slider("Max stocks to scan", 20, 600, 200, step=20)
+            bo_industries = sorted(get_all_categories())
+            bo_options = [f"{ind} ({len(get_stocks_by_category(ind))} stocks)" for ind in bo_industries]
+            bo_selected = st.sidebar.selectbox("Select Industry", bo_options)
+            bo_industry = bo_selected.split(" (")[0]
+            universe = dict(get_stocks_by_category(bo_industry))
+            universe_label = bo_industry
+            
+            scan_cap = st.sidebar.slider("Max stocks to scan", 20, 400, 120, step=20,
+                                         help="Intraday data is heavy — cap the scan size to avoid rate limits")
             if len(universe) > scan_cap:
                 universe = dict(list(universe.items())[:scan_cap])
         
         else:
             custom_input = st.sidebar.text_area(
-                "Tickers (comma or newline separated)",
+                "Enter Tickers (comma or newline separated)",
                 placeholder="RELIANCE.NS, TCS.NS, HDFCBANK.NS",
                 height=120
             )
@@ -3064,299 +2688,207 @@ def main():
             universe = {t: t.replace('.NS', '').replace('.BO', '') for t in raw}
             universe_label = "Custom List"
         
-        # ---------------- The three criteria ----------------
-        st.sidebar.markdown("### 📈 52-Week High Proximity")
-        near_high_pct = st.sidebar.slider(
-            "Within % of 52W high", 0.5, 25.0, 5.0, 0.5,
-            help="How close to the 52-week high the stock must be trading. "
-                 "5% means the price is no more than 5% below its 52-week high."
-        )
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**🎚️ Breakout Filters**")
         
-        st.sidebar.markdown("### 💰 Valuation")
-        
-        st.sidebar.checkbox(
-            "Industry P/E = peer average", value=True, key="use_peer_pe",
-            help="Replaces the static benchmark table with the mean trailing P/E "
-                 "of the stocks in that industry. Stocks with no P/E are excluded, "
-                 "not counted as zero. Applies to every screen in the app."
-        )
-        if st.session_state.get("use_peer_pe"):
-            with st.sidebar.expander("Peer P/E settings"):
-                st.number_input("Max stocks sampled", 10, 300, 60, 10,
-                                key="peer_pe_sample",
-                                help="First run costs one cached call per stock.")
-                st.number_input("Ignore P/E above", 20.0, 1000.0, 200.0, 10.0,
-                                key="peer_pe_cap",
-                                help="One 900x outlier moves a 20-stock mean by "
-                                     "45 points. Set very high to disable.")
-                st.number_input("Min stocks required", 1, 20, 3, 1,
-                                key="peer_pe_min_n",
-                                help="Below this, the static benchmark is kept.")
-        
-        min_upside = st.sidebar.slider(
-            "Min Upside % vs Fair Value", 0, 100, 15, 5,
-            help="Fair value uses the same model as the Industry Screener, so the "
-                 "numbers reconcile between the two screens."
-        )
-        
-        st.sidebar.markdown("### 📅 Earnings Window")
-        earnings_choice = st.sidebar.selectbox(
-            "Earnings filter", list(EARNINGS_MODES.keys()), index=0
-        )
-        earnings_mode = EARNINGS_MODES[earnings_choice]
-        
-        reported_days = 30
-        upcoming_days = 30
-        if earnings_mode in ("reported", "either"):
-            reported_days = st.sidebar.slider("Reported within last N days", 1, 90, 30, 1)
-        if earnings_mode in ("upcoming", "either"):
-            upcoming_days = st.sidebar.slider("Due within next N days", 1, 90, 30, 1)
-        
-        with st.sidebar.expander("🔎 Earnings date sources"):
-            st.caption("Yahoo has no earnings dates for much of the NSE mid and "
-                       "small cap universe. These fallbacks fill the gaps.")
-            allow_estimate = st.checkbox(
-                "Estimate from quarter end", value=True,
-                help="When no announcement date exists, infer one from the most "
-                     "recent reported quarter plus the SEBI filing deadline "
-                     "(45 days, 60 for Q4). Always flagged as an estimate."
-            )
-            allow_nse = st.checkbox(
-                "Try NSE board meetings", value=False,
-                help="Queries the NSE board-meeting calendar. NSE blocks most "
-                     "datacentre IPs, so this usually fails on Streamlit Cloud "
-                     "and other hosted environments. Slow when it does work."
-            )
-            if allow_nse:
-                st.caption("⚠️ Adds a per-stock web request. Expect it to fail "
-                           "silently when hosted.")
-        
-        if earnings_mode == "upcoming":
-            st.sidebar.warning(
-                "⚠️ Holding into an earnings date means holding gap risk. A gap "
-                "through your stop is an uncontrolled loss, not a controlled one."
-            )
-        
-        st.sidebar.markdown("### 🎚️ Basic Filters")
+        donchian_len = st.sidebar.slider("Breakout Lookback (bars)", 5, 60, 20,
+                                         help="Close must break the highest high / lowest low of these prior bars")
+        rel_vol_threshold = st.sidebar.slider("Min Relative Volume", 0.5, 5.0, 1.5, 0.1,
+                                              help="Latest candle volume ÷ 20-bar average volume")
+        min_score = st.sidebar.slider("Min Breakout Score", 0, 100, 55, 5)
         min_price = st.sidebar.number_input("Min Price (₹)", min_value=1.0, value=20.0, step=5.0)
-        min_avg_volume = st.sidebar.number_input("Min Avg Daily Volume", min_value=0,
-                                                 value=50000, step=10000)
-        max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="ev_max_results")
-        max_valuation_calls = st.sidebar.slider(
-            "Max stocks to value", 25, 300, 150, 25,
-            help="Caps the per-ticker work after the 52-week high filter. Lower is faster."
-        )
-        final_rank = st.sidebar.selectbox(
-            "Rank results by",
-            ["Upside %", "Closest to 52W High", "Earnings Soonest", "Best Surprise"]
+        min_avg_volume = st.sidebar.number_input("Min Avg Bar Volume", min_value=0, value=25000, step=5000,
+                                                 help="Liquidity filter on the average volume per candle")
+        max_results = st.sidebar.slider("Max Results", 10, 100, 40, key="bo_max_results")
+        
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**💰 Valuation Overlay**")
+        
+        include_valuation = st.sidebar.checkbox(
+            "Fetch Fair Value & Upside %",
+            value=True,
+            help="Runs the fundamental fair-value model on the stocks that pass the "
+                 "technical screen. Adds a few seconds per scan; results are cached for 1 hour."
         )
         
-        with st.expander("📐 How this screen works, and what the two earnings windows mean"):
-            st.markdown("""
-Three filters, applied in this order so the expensive calls only touch survivors:
+        min_upside = None
+        if include_valuation:
+            apply_upside_filter = st.sidebar.checkbox(
+                "Only show undervalued breakouts",
+                value=False,
+                help="Keeps only setups that are breaking out AND trading below fair value"
+            )
+            if apply_upside_filter:
+                min_upside = st.sidebar.slider("Min Upside %", -20, 100, 15, 5)
+        
+        st.sidebar.markdown("---")
+        
+        required_criteria = st.sidebar.multiselect(
+            "🔒 Mandatory Criteria",
+            options=list(BREAKOUT_CRITERIA_LABELS.keys()),
+            default=['donchian_break', 'volume_surge', 'vwap_side'],
+            format_func=lambda k: BREAKOUT_CRITERIA_LABELS[k],
+            help="A stock must satisfy ALL selected criteria to appear in the results"
+        )
+        
+        with st.expander("📚 Breakout criteria used in this scan"):
+            st.markdown(f"""
+| # | Criterion | Weight | What it checks |
+|---|-----------|--------|----------------|
+| 1 | **N-Bar Range Breakout** | 20 | Close breaks the highest high (or lowest low) of the prior {donchian_len} candles |
+| 2 | **Volume Surge** | 15 | Latest candle volume ≥ {rel_vol_threshold:.1f}× the 20-bar average volume |
+| 3 | **Price vs VWAP** | 10 | Close is above (below) the session-anchored VWAP |
+| 4 | **Fresh VWAP Cross** | 5 | Price crossed VWAP on this very candle — an early entry signal |
+| 5 | **EMA 20/50 Stack** | 10 | Close > EMA20 > EMA50 (trend alignment on the lower timeframe) |
+| 6 | **RSI Momentum Zone** | 8 | RSI(14) in 55–82 for longs / 18–45 for shorts — momentum without exhaustion |
+| 7 | **ATR Range Expansion** | 7 | Candle range ≥ 1.2× ATR(14) — real expansion, not a drift |
+| 8 | **Opening Range Breakout** | 8 | Close beyond the first-hour high/low of the current session |
+| 9 | **Previous Day High/Low Break** | 7 | Close beyond the prior session's high/low |
+| 10 | **Volatility Squeeze Release** | 5 | Bollinger width was in its bottom quartile just before the move |
+| 11 | **Strong Candle Close** | 5 | Close in the top (bottom) 40% of the candle range |
 
-1. **Near the 52-week high** — from daily bars, batched. Breakouts into blue sky
-   have better follow-through than breakouts in the middle of a range.
-2. **Undervalued** — price below the fair value estimate, same model the Industry
-   Screener uses.
-3. **Earnings window** — where the stock sits in its reporting cycle.
-
-**These two earnings windows are opposite trades, and it matters which you pick.**
-
-*Reported in the last N days* is **post-earnings announcement drift** — a documented
-tendency for price to keep moving in the direction of an earnings surprise for weeks
-afterwards. The event risk is behind you and the surprise is known, which is why the
-**Last Surprise** column matters most in this mode: drift follows the beats.
-
-*Due in the next N days* is the **run-up** trade, and it carries the risk I would
-normally tell you to screen out. You are holding through a binary event. A gap
-against you passes straight through a stop. If you run this mode, size for the gap
-rather than for the stop.
-
-Combining "undervalued" with "near 52-week high" is deliberately contrarian — most
-stocks near highs are not cheap. Expect few results, and treat a large `Upside %`
-on a stock at its high with suspicion: check whether the fair value is being driven
-by a single depressed input like a trailing EPS that has since recovered.
+**Score = sum of the weights of every criterion met (max 100).**
             """)
         
-        if st.session_state.get("use_peer_pe") and universe_mode == "By Industry" and universe_label:
-            _peer = compute_peer_industry_pe(
-                universe_label,
-                max_sample=int(st.session_state.get("peer_pe_sample", 60)),
-                pe_cap=float(st.session_state.get("peer_pe_cap", 200.0))
-            )
-            if _peer and _peer.get('n', 0) > 0:
-                _static = None
-                try:
-                    _static = INDUSTRY_BENCHMARKS.get(universe_label, {}).get('pe')
-                except Exception:
-                    pass
-                pc1, pc2, pc3, pc4 = st.columns(4)
-                pc1.metric("Peer P/E (mean)", f"{_peer['mean']:.2f}")
-                pc2.metric("Peer P/E (median)", f"{_peer['median']:.2f}")
-                pc3.metric("Stocks with P/E", f"{_peer['n']} / {_peer['sample_size']}")
-                pc4.metric("Static table P/E", f"{_static:.2f}" if _static else "N/A")
-                st.caption(
-                    f"Excluded — no P/E: {_peer['excluded_missing']} · "
-                    f"loss-making or negative: {_peer['excluded_negative']} · "
-                    f"above cap: {_peer['excluded_outlier']}. "
-                    f"The mean of the {_peer['n']} available P/Es is what the fair "
-                    f"value model uses."
-                )
-                if _peer['median'] and abs(_peer['mean'] - _peer['median']) > 0.35 * _peer['median']:
-                    st.warning(
-                        f"⚠️ Mean ({_peer['mean']:.1f}) and median ({_peer['median']:.1f}) "
-                        f"diverge sharply, so the average is being pulled by a few "
-                        f"high-P/E names. Consider lowering the 'Ignore P/E above' cap."
-                    )
-        
-        if st.sidebar.button("🔍 Run Screen", type="primary"):
+        if st.sidebar.button("⚡ Run Breakout Scan", type="primary"):
             if not universe:
-                st.warning("❌ No tickers in the selected universe.")
+                st.warning("❌ No tickers in the selected universe. Add tickers or pick another universe.")
             else:
                 st.markdown(f'''
                 <div class="highlight-box">
-                    <h3>📅 {earnings_choice}</h3>
+                    <h3>⚡ {direction} — {timeframe_label} Chart</h3>
                     <p><strong>Universe:</strong> {universe_label} ({len(universe):,} stocks)</p>
-                    <p><strong>Within:</strong> {near_high_pct:.1f}% of 52W high &nbsp;•&nbsp;
-                       <strong>Min Upside:</strong> {min_upside}%</p>
+                    <p><strong>Breakout Lookback:</strong> {donchian_len} bars &nbsp;•&nbsp;
+                       <strong>Min Rel Vol:</strong> {rel_vol_threshold:.1f}x &nbsp;•&nbsp;
+                       <strong>Min Score:</strong> {min_score}</p>
                 </div>
                 ''', unsafe_allow_html=True)
                 
-                with st.spinner(f"🔍 Screening {len(universe):,} stocks..."):
-                    ev_df, ev_funnel = run_earnings_value_screener(
+                with st.spinner(f"⚡ Scanning {len(universe):,} stocks on {timeframe_label} candles..."):
+                    bo_df = run_breakout_screener(
                         universe=universe,
-                        near_high_pct=near_high_pct,
-                        min_upside=min_upside,
-                        earnings_mode=earnings_mode,
-                        upcoming_days=upcoming_days,
-                        reported_days=reported_days,
+                        timeframe_label=timeframe_label,
+                        direction=direction,
+                        rel_vol_threshold=rel_vol_threshold,
                         min_price=min_price,
                         min_avg_volume=min_avg_volume,
+                        donchian_len=donchian_len,
+                        min_score=min_score,
+                        required_criteria=required_criteria,
                         max_results=max_results,
-                        max_valuation_calls=max_valuation_calls,
-                        final_rank=final_rank,
-                        allow_nse=allow_nse,
-                        allow_estimate=allow_estimate
+                        include_valuation=include_valuation,
+                        min_upside=min_upside
                     )
                 
-                st.session_state['ev_results'] = ev_df
-                st.session_state['ev_funnel'] = ev_funnel
-                st.session_state['ev_meta'] = {
-                    'universe_label': universe_label,
-                    'earnings_choice': earnings_choice,
-                    'near_high_pct': near_high_pct,
-                    'min_upside': min_upside
+                st.session_state['breakout_results'] = bo_df
+                st.session_state['breakout_meta'] = {
+                    'timeframe': timeframe_label,
+                    'direction': direction,
+                    'universe_label': universe_label
                 }
         
-        # ---------------- Render results ----------------
-        ev_df = st.session_state.get('ev_results')
-        ev_meta = st.session_state.get('ev_meta', {})
-        ev_funnel = st.session_state.get('ev_funnel', {})
+        # ---------------- Render persisted breakout results ----------------
+        bo_df = st.session_state.get('breakout_results')
+        bo_meta = st.session_state.get('breakout_meta', {})
         
-        if ev_df is not None:
-            if ev_funnel:
-                st.markdown("##### 🔻 Funnel")
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Scanned", ev_funnel.get('scanned', 0))
-                c2.metric("Had Data", ev_funnel.get('with_data', 0))
-                c3.metric("Near 52W High", ev_funnel.get('near_high', 0))
-                c4.metric("Undervalued", ev_funnel.get('undervalued', 0))
-                c5.metric("Earnings Match", ev_funnel.get('earnings_ok', 0))
-            
-            if ev_df.empty:
-                st.warning(
-                    "❌ Nothing passed all three filters. The binding constraint is usually "
-                    "the combination of *undervalued* and *near the 52-week high* — those two "
-                    "pull against each other. Widen the 52-week band, lower the minimum "
-                    "upside, or check the funnel above to see which stage emptied out."
-                )
+        if bo_df is not None:
+            if bo_df.empty:
+                st.warning("❌ No breakout setups found with the current filters. "
+                           "Try lowering the Min Score, reducing Min Relative Volume, "
+                           "or relaxing the mandatory criteria.")
             else:
                 st.markdown(f'''
                 <div class="success-message">
-                    ✅ <strong>{len(ev_df)}</strong> undervalued stocks near their 52-week high<br>
-                    📅 {ev_meta.get('earnings_choice', earnings_choice)}<br>
-                    🌐 Universe: {ev_meta.get('universe_label', universe_label)}
+                    ✅ Found <strong>{len(bo_df)}</strong> {bo_meta.get('direction', direction).lower()} setups
+                    on the <strong>{bo_meta.get('timeframe', timeframe_label)}</strong> chart<br>
+                    🌐 Universe: {bo_meta.get('universe_label', universe_label)}
                 </div>
                 ''', unsafe_allow_html=True)
                 
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Results", len(ev_df))
-                m2.metric("Avg Upside",
-                          f"{ev_df['Upside %'].mean():+.1f}%"
-                          if 'Upside %' in ev_df.columns and ev_df['Upside %'].notna().any() else "N/A")
-                m3.metric("Avg From High",
-                          f"{ev_df['From High %'].mean():.2f}%"
-                          if 'From High %' in ev_df.columns and ev_df['From High %'].notna().any() else "N/A")
-                if 'Surprise %' in ev_df.columns and ev_df['Surprise %'].notna().any():
-                    m4.metric("Beats", int((ev_df['Surprise %'] > 0).sum()))
+                # Summary metrics
+                s1, s2, s3, s4, s5 = st.columns(5)
+                s1.metric("Setups Found", len(bo_df))
+                s2.metric("Avg Score", f"{bo_df['Score'].mean():.0f}")
+                s3.metric("Avg Rel Vol", f"{bo_df['Rel Vol'].mean():.2f}x")
+                s4.metric("Fresh Breakouts", int(bo_df['Setup'].str.contains('Fresh').sum()))
+                
+                if 'Upside %' in bo_df.columns and bo_df['Upside %'].notna().any():
+                    _avg_up = bo_df['Upside %'].dropna().mean()
+                    _undervalued = int((bo_df['Upside %'].dropna() >= 15).sum())
+                    s5.metric("Avg Upside", f"{_avg_up:+.1f}%",
+                              delta=f"{_undervalued} undervalued", delta_color="off")
                 else:
-                    m4.metric("Beats", "N/A")
+                    s5.metric("Avg Upside", "N/A")
                 
-                ev_display = ev_df.copy()
+                bo_display = bo_df.copy()
                 
-                for col in ['LTP', '52W High', 'Fair Value']:
-                    if col in ev_display.columns:
-                        ev_display[col] = ev_display[col].apply(
+                for col in ['LTP', 'Fair Value', 'Breakout Level', 'VWAP', 'EMA20', 'EMA50',
+                            'ORB High', 'ORB Low', 'Prev Day High', 'Prev Day Low']:
+                    if col in bo_display.columns:
+                        bo_display[col] = bo_display[col].apply(
                             lambda x: f"₹{x:,.2f}" if pd.notna(x) else 'N/A')
                 
-                for col in ['Chg %', 'From High %', 'Upside %', 'From Low %']:
-                    if col in ev_display.columns:
-                        ev_display[col] = ev_display[col].apply(
+                for col in ['Day Chg %', 'VWAP Dist %', 'Upside %']:
+                    if col in bo_display.columns:
+                        bo_display[col] = bo_display[col].apply(
                             lambda x: f"{x:+.2f}%" if pd.notna(x) else 'N/A')
                 
-                for col in ['Volume', 'Avg Volume']:
-                    if col in ev_display.columns:
-                        ev_display[col] = ev_display[col].apply(format_volume)
-                if 'Rel Vol' in ev_display.columns:
-                    ev_display['Rel Vol'] = ev_display['Rel Vol'].apply(
+                if 'PE Ratio' in bo_display.columns:
+                    bo_display['PE Ratio'] = bo_display['PE Ratio'].apply(
                         lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
-                if 'PE Ratio' in ev_display.columns:
-                    ev_display['PE Ratio'] = ev_display['PE Ratio'].apply(
-                        lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
-                if 'Market Cap' in ev_display.columns:
-                    ev_display['Market Cap'] = ev_display['Market Cap'].apply(
-                        lambda x: f"₹{x/10000000:,.0f}Cr" if pd.notna(x) else 'N/A')
-                for col in ['Days To', 'Days Since']:
-                    if col in ev_display.columns:
-                        ev_display[col] = ev_display[col].apply(
-                            lambda x: f"{int(x)}d" if pd.notna(x) else 'N/A')
                 
-                ev_columns = ['Ticker', 'Name', 'LTP', 'From High %', '52W High',
-                              'Fair Value', 'Upside %', 'Value Tag', 'FV Source',
-                              'Earnings', 'Date Source', 'Last Earnings', 'Days Since',
-                              'Last Surprise', 'Next Earnings', 'Days To',
-                              'Volume', 'Avg Volume', 'Rel Vol', 'Chg %',
-                              'PE Ratio', 'Cap Type', 'As Of', 'Valuation']
-                ev_columns = [c for c in ev_columns if c in ev_display.columns]
+                if 'Market Cap' in bo_display.columns:
+                    bo_display['Market Cap'] = bo_display['Market Cap'].apply(
+                        lambda x: f"₹{x/10000000:,.0f}Cr" if pd.notna(x) else 'N/A')
+                
+                if 'ATR %' in bo_display.columns:
+                    bo_display['ATR %'] = bo_display['ATR %'].apply(
+                        lambda x: f"{x:.2f}%" if pd.notna(x) else 'N/A')
+                
+                if 'RSI' in bo_display.columns:
+                    bo_display['RSI'] = bo_display['RSI'].apply(
+                        lambda x: f"{x:.1f}" if pd.notna(x) else 'N/A')
+                
+                # Latest candle volume + session volume in Indian format
+                for col in ['Volume', 'Avg Volume', 'Session Volume']:
+                    if col in bo_display.columns:
+                        bo_display[col] = bo_display[col].apply(format_volume)
+                
+                if 'Rel Vol' in bo_display.columns:
+                    bo_display['Rel Vol'] = bo_display['Rel Vol'].apply(
+                        lambda x: f"{x:.2f}x" if pd.notna(x) else 'N/A')
+                
+                bo_columns = ['Ticker', 'Name', 'Timeframe', 'LTP', 'Fair Value', 'Upside %',
+                              'Value Tag', 'Day Chg %', 'Score', 'Setup', 'Breakout Level',
+                              'Volume', 'Rel Vol', 'Session Volume', 'VWAP', 'VWAP Dist %',
+                              'RSI', 'ATR %', 'PE Ratio', 'Cap Type', 'Last Candle', 'Valuation']
+                bo_columns = [c for c in bo_columns if c in bo_display.columns]
                 
                 st.dataframe(
-                    ev_display[ev_columns],
+                    bo_display[bo_columns],
                     use_container_width=True,
                     hide_index=True,
-                    height=min(600, len(ev_display) * 35 + 100),
+                    height=min(600, len(bo_display) * 35 + 100),
                     column_config=valuation_column_config()
                 )
                 
-                render_valuation_jump(ev_df, "earnings_value")
+                # In-app jump to the valuation screen for any breakout stock
+                render_valuation_jump(bo_df, "breakout_screener")
                 
-                render_manual_fair_value('ev_results', key_prefix="ev_mfv")
+                with st.expander("🔍 Criteria met per stock"):
+                    st.dataframe(
+                        bo_df[['Ticker', 'Score', 'Criteria Count', 'Criteria Met']],
+                        use_container_width=True,
+                        hide_index=True
+                    )
                 
-                with st.expander("📅 Earnings detail"):
-                    st.caption("A positive last surprise is what post-earnings drift follows. "
-                               "An upcoming date inside your intended holding period is gap risk.")
-                    e_cols = ['Ticker', 'Date Source', 'Estimated', 'Last Earnings',
-                              'Days Since', 'Last Surprise', 'Next Earnings', 'Days To',
-                              'Upside %', 'From High %']
-                    e_cols = [c for c in e_cols if c in ev_df.columns]
-                    st.dataframe(ev_df[e_cols], use_container_width=True, hide_index=True)
-                
-                ev_csv = ev_df.to_csv(index=False)
-                ev_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                bo_csv = bo_df.to_csv(index=False)
+                bo_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                bo_tf = bo_meta.get('timeframe', timeframe_label).replace(' ', '')
                 st.download_button(
-                    f"📥 Download Results ({len(ev_df)} stocks)",
-                    data=ev_csv,
-                    file_name=f"NYZTrade_EarningsValue_{ev_ts}.csv",
+                    f"📥 Download Breakout Results ({len(bo_df)} stocks)",
+                    data=bo_csv,
+                    file_name=f"NYZTrade_Breakout_{bo_tf}_{bo_ts}.csv",
                     mime="text/csv",
                     use_container_width=True
                 )
